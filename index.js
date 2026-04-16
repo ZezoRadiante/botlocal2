@@ -16,15 +16,22 @@ const CLIENT_SECRET = process.env.SYNCPAY_CLIENT_SECRET;
 const META_PIXEL_ID = process.env.META_PIXEL_ID;
 const META_TOKEN = process.env.META_TOKEN;
 
-// ================= VIDEOS =================
-// Depois de capturar no seu próprio bot, cole os IDs aqui.
-// Pode deixar vazio por enquanto.
-const VIDEO_START = process.env.VIDEO_START_FILE_ID || '';
-const VIDEO_BUMP = process.env.VIDEO_BUMP_FILE_ID || '';
+// ================= MEDIA =================
+const VIDEO_START = 'BAACAgEAAxkBAANjaeE1lWS7RCCUF3G0cehARZeHIxoAArkGAAIqEglHTEGxhQwHcS87BA';
+const VIDEO_BUMP = 'BAACAgEAAxkBAANlaeE1r7jftHF1Z1ZkDpTLWFFY1_cAAroGAAIqEglHsnlZ68ElDLU7BA';
 
-// ================= CAPTURE MODE =================
-// true = captura file_id nos logs quando você enviar mídia pro bot
-const CAPTURE_FILE_ID_MODE = true;
+// Futuras mídias do downsell:
+// Pode usar file_id de vídeo, foto, gif/document, etc.
+const DOWNSELL_MEDIA = {
+  enabled: false,
+  type: 'video', // 'video' | 'photo' | 'document'
+  fileId: '',
+  caption: `
+⚠️ ÚLTIMA CHANCE
+
+Se você não quer seguir com a oferta principal, temos uma condição especial por tempo limitado.
+`
+};
 
 // ================= VALIDATION =================
 if (!TOKEN) throw new Error('BOT_TOKEN não configurado');
@@ -175,13 +182,14 @@ function extractPixCode(data) {
   );
 }
 
-function createTransactionRecord({ txId, chat_id, user, amount, upsell = false }) {
+function createTransactionRecord({ txId, chat_id, user, amount, upsell = false, downsell = false }) {
   transactions[txId] = {
     txId,
     chat_id,
     user: { ...user },
     amount: roundMoney(amount),
     upsell,
+    downsell,
     status: 'pending',
     createdAt: Date.now(),
     updatedAt: Date.now()
@@ -300,15 +308,49 @@ async function createSyncPayCashIn(amount) {
   return { txId, pixCode, raw: data };
 }
 
+// ================= MEDIA SENDERS =================
+async function sendOptionalVideo(chat_id, fileId, logLabel) {
+  if (!fileId) return;
+
+  try {
+    await bot.sendVideo(chat_id, fileId);
+  } catch (err) {
+    console.log(`${logLabel} ERROR:`, err.response?.data || err.message || err);
+  }
+}
+
+async function sendDownsellMedia(chat_id) {
+  if (!DOWNSELL_MEDIA.enabled || !DOWNSELL_MEDIA.fileId) return;
+
+  try {
+    if (DOWNSELL_MEDIA.type === 'video') {
+      await bot.sendVideo(chat_id, DOWNSELL_MEDIA.fileId, {
+        caption: DOWNSELL_MEDIA.caption || ''
+      });
+      return;
+    }
+
+    if (DOWNSELL_MEDIA.type === 'photo') {
+      await bot.sendPhoto(chat_id, DOWNSELL_MEDIA.fileId, {
+        caption: DOWNSELL_MEDIA.caption || ''
+      });
+      return;
+    }
+
+    if (DOWNSELL_MEDIA.type === 'document') {
+      await bot.sendDocument(chat_id, DOWNSELL_MEDIA.fileId, {
+        caption: DOWNSELL_MEDIA.caption || ''
+      });
+      return;
+    }
+  } catch (err) {
+    console.log('DOWNSELL MEDIA ERROR:', err.response?.data || err.message || err);
+  }
+}
+
 // ================= FLOW MESSAGES =================
 async function sendPlanMessage(chat_id) {
-  if (VIDEO_START) {
-    try {
-      await bot.sendVideo(chat_id, VIDEO_START);
-    } catch (err) {
-      console.log('START VIDEO ERROR:', err.response?.data || err.message || err);
-    }
-  }
+  await sendOptionalVideo(chat_id, VIDEO_START, 'START VIDEO');
 
   return bot.sendMessage(chat_id, `
 ⬇️ VEJA COMO É O VIP POR DENTRO DIVIDIDO EM TÓPICOS PARA VOCÊ 🔴
@@ -345,13 +387,7 @@ async function sendPlanMessage(chat_id) {
 }
 
 async function sendOrderBumpMessage(chat_id) {
-  if (VIDEO_BUMP) {
-    try {
-      await bot.sendVideo(chat_id, VIDEO_BUMP);
-    } catch (err) {
-      console.log('BUMP VIDEO ERROR:', err.response?.data || err.message || err);
-    }
-  }
+  await sendOptionalVideo(chat_id, VIDEO_BUMP, 'BUMP VIDEO');
 
   return bot.sendMessage(chat_id, `
 🚫 LIVES BANIDAS 🔥
@@ -390,8 +426,34 @@ Nós prezamos pela segurança dos membros.
   });
 }
 
+// Estrutura pronta para futuro downsell.
+// Hoje ela só envia mídia opcional e uma mensagem simples.
+// Depois você pode chamar essa função no ponto do funil que quiser.
+async function sendDownsellMessage(chat_id) {
+  await sendDownsellMedia(chat_id);
+
+  return bot.sendMessage(chat_id, `
+⚠️ OFERTA ESPECIAL
+
+Ainda dá tempo de garantir uma condição diferente antes de sair.
+`, {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '💥 QUERO VER A OFERTA', callback_data: 'downsell_view' }],
+        [{ text: '❌ SAIR', callback_data: 'downsell_exit' }]
+      ]
+    }
+  });
+}
+
 // ================= PAYMENT =================
-async function goToPayment(chat_id, user, isUpsell = false, forcedAmount = null) {
+async function goToPayment(chat_id, user, options = {}) {
+  const {
+    isUpsell = false,
+    isDownsell = false,
+    forcedAmount = null
+  } = options;
+
   try {
     const amount = roundMoney(forcedAmount ?? user.value);
 
@@ -406,7 +468,8 @@ async function goToPayment(chat_id, user, isUpsell = false, forcedAmount = null)
       chat_id,
       user,
       amount,
-      upsell: isUpsell
+      upsell: isUpsell,
+      downsell: isDownsell
     });
 
     console.log('SYNCPAY CASHIN OK:', raw);
@@ -452,31 +515,6 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
   }
 });
 
-// ================= TEMP FILE_ID CAPTURE =================
-bot.on('message', async (msg) => {
-  if (!CAPTURE_FILE_ID_MODE) return;
-
-  try {
-    const chatId = msg.chat.id;
-
-    if (msg.video) {
-      console.log('CAPTURE VIDEO FILE_ID:', msg.video.file_id);
-      console.log('CAPTURE VIDEO FILE_UNIQUE_ID:', msg.video.file_unique_id);
-      await bot.sendMessage(chatId, `VIDEO FILE_ID:\n${msg.video.file_id}`);
-      return;
-    }
-
-    if (msg.document) {
-      console.log('CAPTURE DOCUMENT FILE_ID:', msg.document.file_id);
-      console.log('CAPTURE DOCUMENT FILE_UNIQUE_ID:', msg.document.file_unique_id);
-      await bot.sendMessage(chatId, `DOCUMENT FILE_ID:\n${msg.document.file_id}`);
-      return;
-    }
-  } catch (err) {
-    console.log('CAPTURE FILE_ID ERROR:', err.response?.data || err.message || err);
-  }
-});
-
 // ================= TELEGRAM CALLBACK =================
 bot.on('callback_query', async (query) => {
   try {
@@ -517,11 +555,11 @@ bot.on('callback_query', async (query) => {
 
     if (data === 'bump_yes') {
       user.value = roundMoney(Number(user.value || 0) + 4.99);
-      return await goToPayment(chat_id, user, false);
+      return await goToPayment(chat_id, user, { isUpsell: false });
     }
 
     if (data === 'bump_no') {
-      return await goToPayment(chat_id, user, false);
+      return await goToPayment(chat_id, user, { isUpsell: false });
     }
 
     if (data === 'upsell_buy') {
@@ -531,7 +569,19 @@ bot.on('callback_query', async (query) => {
         event_id: uuidv4()
       };
 
-      return await goToPayment(chat_id, upsellUser, true, 10);
+      return await goToPayment(chat_id, upsellUser, {
+        isUpsell: true,
+        forcedAmount: 10
+      });
+    }
+
+    // Estrutura pronta para futuro downsell
+    if (data === 'downsell_view') {
+      return await bot.sendMessage(chat_id, '✅ Estrutura de downsell pronta para você personalizar depois.');
+    }
+
+    if (data === 'downsell_exit') {
+      return await bot.sendMessage(chat_id, 'Tudo bem.');
     }
   } catch (err) {
     console.log('CALLBACK ERROR:', err.response?.data || err.message || err);
@@ -616,6 +666,9 @@ Seu acesso está sendo liberado...
 `);
 
       await sendUpsellMessage(chat_id);
+
+      // Futuro: se quiser chamar downsell em outra etapa, a estrutura já existe
+      // await sendDownsellMessage(chat_id);
     } else {
       await bot.sendMessage(chat_id, `
 🚀 ACESSO TOTAL LIBERADO!
