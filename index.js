@@ -162,6 +162,8 @@ function extractTransactionId(data) {
   return (
     data?.id ||
     data?.data?.id ||
+    data?.identifier ||
+    data?.data?.identifier ||
     data?.reference_id ||
     data?.transaction_id ||
     null
