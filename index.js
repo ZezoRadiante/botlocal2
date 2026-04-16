@@ -19,6 +19,21 @@ app.use(bodyParser.json());
 const users = {};
 const transactions = {};
 
+// ================= HELPERS =================
+function getUser(chat_id) {
+  if (!users[chat_id]) {
+    users[chat_id] = {
+      fbc: "",
+      fbp: "",
+      ip: "",
+      ua: "",
+      event_id: uuidv4(),
+      value: 0
+    };
+  }
+  return users[chat_id];
+}
+
 // ================= META =================
 async function sendToMeta(event_name, user) {
   try {
@@ -70,41 +85,26 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
     fbp: payload.fbp || "",
     ip: payload.ip || "",
     ua: payload.ua || "",
-    event_id
+    event_id,
+    value: 0
   };
 
   await sendToMeta("PageView", users[chat_id]);
 
-  // 🔥 MENSAGEM PRINCIPAL + PLANOS
   await bot.sendMessage(chat_id, `
-⬇️ VEJA COMO É O VIP POR DENTRO DIVIDIDO EM TÓPICOS PARA VOCÊ 🔴
+⬇️ VEJA COMO É O VIP POR DENTRO 🔴
 
-😍 OnlyFans 🔴 Vídeos raros
-😈 Privacy ✨ Lives¹⁸
-🌈 Novinhas¹⁸ ❤️ Close Friends
-👀 Inc3st0 😢 Em Público
-💕 Fetiches 🌈 Amador
-🍼 Milf’s 🔞 PROIBIDINHOS¹⁸
-😳 F4M1L1A S4c4na 💋 Ocultos¹⁸
-😡 Faveladas 🔥 KAM1LINHA
-🙈 Sexo na faculdade¹⁸
-🌈 Un1vers1t4r1as V4z4d4s¹⁸
+📁 +200k mídias
+🔴 conteúdo atualizado
+🔥 acesso imediato
 
-📁 +207.629 mídias no nosso VIP
-🔴 +31.735 mídias OCULTAS
-😈 + 6 Grupos secretos
-
-⚠️ sua gozada garantida ou seu dinheiro de volta!
-
-🚀 Acesso imediato!
-⏰ PROMOÇÃO ENCERRA EM 6 MINUTOS!
-💥 (9 vagas restantes)
+⚠️ promoção por tempo limitado
 `, {
     reply_markup: {
       inline_keyboard: [
-        [{ text: "⭐ 1 SEMANA 30% OFF - R$7.42", callback_data: "plan_week" }],
+        [{ text: "⭐ 1 SEMANA - R$7.42", callback_data: "plan_week" }],
         [{ text: "🔥 VIP VITALÍCIO - R$15.42", callback_data: "plan_vip" }],
-        [{ text: "🌸 VITALÍCIO + PASTAS - R$23.42", callback_data: "plan_full" }]
+        [{ text: "🌸 VIP COMPLETO - R$23.42", callback_data: "plan_full" }]
       ]
     }
   });
@@ -113,7 +113,7 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
 // ================= FLOW =================
 bot.on("callback_query", async (query) => {
   const chat_id = query.message.chat.id;
-  const user = users[chat_id];
+  const user = getUser(chat_id);
 
   // ================= PLANOS =================
   if (query.data.startsWith("plan_")) {
@@ -124,16 +124,10 @@ bot.on("callback_query", async (query) => {
 
     await sendToMeta("InitiateCheckout", user);
 
-    // 🔥 ORDER BUMP
     await bot.sendMessage(chat_id, `
-🚫 LIVES BANIDAS 🔥
+🚫 ORDER BUMP
 
-😈 Não perca o acesso das Lives mais exclusivas do Brasil!
-
-📁 SEPARADAS POR PASTAS
-💎 CONTEÚDOS ATUALIZADOS DIARIAMENTE
-
-🔥 ADICIONE POR APENAS R$4,99
+Adicione acesso extra por apenas R$4,99
 `, {
       reply_markup: {
         inline_keyboard: [[
@@ -146,7 +140,7 @@ bot.on("callback_query", async (query) => {
 
   // ================= ORDER BUMP =================
   if (query.data === "bump_yes") {
-    user.value += 4.99;
+    user.value = (user.value || 0) + 4.99;
     return goToPayment(chat_id, user);
   }
 
@@ -166,7 +160,7 @@ bot.on("callback_query", async (query) => {
     transactions[tx_id] = { chat_id, user, upsell: true };
 
     await bot.sendMessage(chat_id, `
-🔥 UPSELL VIP 🔥
+🔥 UPSELL VIP
 
 💳 R$10
 
@@ -179,7 +173,7 @@ ${response.data.pix_code}
 async function goToPayment(chat_id, user) {
 
   const response = await axios.post(PIX_API, {
-    amount: user.value
+    amount: user.value || 0
   });
 
   const tx_id = response.data.id;
@@ -189,7 +183,7 @@ async function goToPayment(chat_id, user) {
   await bot.sendMessage(chat_id, `
 💳 PAGAMENTO PIX
 
-Valor: R$ ${user.value}
+Valor: R$ ${user.value || 0}
 
 ${response.data.pix_code}
 `);
@@ -202,6 +196,8 @@ app.post("/webhook", async (req, res) => {
   if (status === "paid" && transactions[id]) {
     const { chat_id, user, upsell } = transactions[id];
 
+    user.value = user.value || 0;
+
     // ================= COMPRA PRINCIPAL =================
     if (!upsell) {
       await sendToMeta("Purchase", user);
@@ -212,29 +208,26 @@ app.post("/webhook", async (req, res) => {
 Seu acesso está sendo liberado...
 `);
 
-      // 🔥 UPSELL APÓS COMPRA
       await bot.sendMessage(chat_id, `
-🔒 Tarifa de Segurança – Verificação Obrigatória
+🔒 TARIFA DE SEGURANÇA
 
-Nós prezamos pela segurança dos membros.
+💳 R$10 (reembolsável)
 
-💳 R$10 (100% reembolsável)
-
-⚠️ Caso não pague, o acesso pode ser bloqueado.
+⚠️ necessário para ativar acesso
 `, {
         reply_markup: {
           inline_keyboard: [
-            [{ text: "🟢 PAGAR TARIFA R$10", callback_data: "upsell_buy" }]
+            [{ text: "🟢 PAGAR R$10", callback_data: "upsell_buy" }]
           ]
         }
       });
 
     } else {
-      // ================= UPSELL CONCLUÍDO =================
+      // ================= UPSELL =================
       await bot.sendMessage(chat_id, `
 🚀 ACESSO TOTAL LIBERADO!
 
-Aproveite todo o conteúdo 🔥
+Aproveite 🔥
 `);
     }
   }
