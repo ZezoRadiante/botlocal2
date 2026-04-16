@@ -20,8 +20,7 @@ const META_TOKEN = process.env.META_TOKEN;
 const VIDEO_START = 'BAACAgEAAxkBAANjaeE1lWS7RCCUF3G0cehARZeHIxoAArkGAAIqEglHTEGxhQwHcS87BA';
 const VIDEO_BUMP = 'BAACAgEAAxkBAANlaeE1r7jftHF1Z1ZkDpTLWFFY1_cAAroGAAIqEglHsnlZ68ElDLU7BA';
 
-// Futuras mídias do downsell:
-// Pode usar file_id de vídeo, foto, gif/document, etc.
+// Futuras mídias do downsell
 const DOWNSELL_MEDIA = {
   enabled: false,
   type: 'video', // 'video' | 'photo' | 'document'
@@ -32,6 +31,23 @@ const DOWNSELL_MEDIA = {
 Se você não quer seguir com a oferta principal, temos uma condição especial por tempo limitado.
 `
 };
+
+// ================= BUMP SCHEDULE =================
+// 12 bumps automáticos
+const ORDER_BUMP_SCHEDULES = [
+  { key: 'bump_1', delayMs: 10 * 60 * 1000 },
+  { key: 'bump_2', delayMs: 20 * 60 * 1000 },
+  { key: 'bump_3', delayMs: 45 * 60 * 1000 },
+  { key: 'bump_4', delayMs: 60 * 60 * 1000 },
+  { key: 'bump_5', delayMs: 2 * 60 * 60 * 1000 },
+  { key: 'bump_6', delayMs: 4 * 60 * 60 * 1000 },
+  { key: 'bump_7', delayMs: 6 * 60 * 60 * 1000 },
+  { key: 'bump_8', delayMs: 8 * 60 * 60 * 1000 },
+  { key: 'bump_9', delayMs: 12 * 60 * 60 * 1000 },
+  { key: 'bump_10', delayMs: 18 * 60 * 60 * 1000 },
+  { key: 'bump_11', delayMs: 24 * 60 * 60 * 1000 },
+  { key: 'bump_12', delayMs: 36 * 60 * 60 * 1000 }
+];
 
 // ================= VALIDATION =================
 if (!TOKEN) throw new Error('BOT_TOKEN não configurado');
@@ -55,6 +71,7 @@ const transactions = {};
 const processedPayments = new Set();
 const actionLock = {};
 const processedMetaEvents = new Set();
+const scheduledBumpTimeouts = {};
 
 let accessToken = null;
 let accessTokenExpiresAt = 0;
@@ -110,6 +127,10 @@ function getUser(chat_id) {
       event_id: uuidv4(),
       value: 0,
       plan: '',
+      hasPaidMain: false,
+      hasPaidUpsell: false,
+      stopRemarketing: false,
+      bumpHistory: {},
       createdAt: Date.now(),
       updatedAt: Date.now()
     };
@@ -201,6 +222,85 @@ function markTransactionPaid(txId) {
   transactions[txId].status = 'paid';
   transactions[txId].updatedAt = Date.now();
   transactions[txId].paidAt = Date.now();
+}
+
+function cancelAllScheduledBumps(chat_id) {
+  const timers = scheduledBumpTimeouts[chat_id];
+  if (!timers) return;
+
+  for (const timeoutId of Object.values(timers)) {
+    clearTimeout(timeoutId);
+  }
+
+  delete scheduledBumpTimeouts[chat_id];
+}
+
+function canSendScheduledBump(chat_id, bumpKey) {
+  const user = users[chat_id];
+  if (!user) return false;
+  if (user.hasPaidMain) return false;
+  if (user.hasPaidUpsell) return false;
+  if (user.stopRemarketing) return false;
+  if (user.bumpHistory?.[bumpKey]) return false;
+  return true;
+}
+
+function getScheduledBumpCopy(index) {
+  const copies = [
+    `🔥 Você entrou e ainda não garantiu seu acesso.\n\nAs vagas promocionais estão acabando e o VIP pode sair do ar a qualquer momento.`,
+    `⚠️ Seu acesso ainda está pendente.\n\nSe quiser entrar com desconto, essa é a melhor hora para finalizar.`,
+    `🚨 Muita gente entra, olha e volta depois.\n\nQuando volta, a promoção já acabou.`,
+    `⏳ Seu benefício ainda está disponível.\n\nMas não dá para garantir por muito tempo.`,
+    `🔥 O conteúdo continua te esperando.\n\nSe quiser aproveitar o valor atual, finalize agora.`,
+    `😈 As melhores pastas e mídias continuam bloqueadas.\n\nSó falta liberar seu acesso.`,
+    `⚠️ Estamos nas últimas vagas promocionais.\n\nDepois disso, o valor pode subir.`,
+    `💥 Últimas horas com essa condição.\n\nSe você quer entrar, esse é o melhor momento.`,
+    `🔥 Seu acesso ainda não foi ativado.\n\nNão deixa para depois e perde a oferta.`,
+    `🚨 Oferta quase encerrada.\n\nAinda dá tempo de entrar pagando menos.`,
+    `⏰ O desconto segue ativo por pouco tempo.\n\nFinalize enquanto ainda está liberado.`,
+    `⚠️ Último aviso.\n\nDepois dessa mensagem, não dá para garantir que o valor continue o mesmo.`
+  ];
+
+  return copies[index] || `⚠️ Sua oferta ainda está disponível por pouco tempo.`;
+}
+
+async function scheduleOrderBumps(chat_id) {
+  const user = getUser(chat_id);
+
+  cancelAllScheduledBumps(chat_id);
+  scheduledBumpTimeouts[chat_id] = {};
+
+  ORDER_BUMP_SCHEDULES.forEach((item, index) => {
+    const timeoutId = setTimeout(async () => {
+      try {
+        if (!canSendScheduledBump(chat_id, item.key)) return;
+
+        const currentUser = getUser(chat_id);
+        currentUser.bumpHistory[item.key] = Date.now();
+
+        await sendOptionalVideo(chat_id, VIDEO_BUMP, `AUTO BUMP VIDEO ${item.key}`);
+
+        await bot.sendMessage(chat_id, `
+${getScheduledBumpCopy(index)}
+
+💳 Toque abaixo para gerar seu pagamento agora.
+`, {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔥 GERAR PIX AGORA', callback_data: 'remarketing_pay_now' }],
+              [{ text: '❌ NÃO QUERO', callback_data: 'remarketing_no' }]
+            ]
+          }
+        });
+      } catch (err) {
+        console.log(`SCHEDULED BUMP ERROR ${item.key}:`, err.response?.data || err.message || err);
+      }
+    }, item.delayMs);
+
+    scheduledBumpTimeouts[chat_id][item.key] = timeoutId;
+  });
+
+  user.updatedAt = Date.now();
 }
 
 // ================= META =================
@@ -426,9 +526,6 @@ Nós prezamos pela segurança dos membros.
   });
 }
 
-// Estrutura pronta para futuro downsell.
-// Hoje ela só envia mídia opcional e uma mensagem simples.
-// Depois você pode chamar essa função no ponto do funil que quiser.
 async function sendDownsellMessage(chat_id) {
   await sendDownsellMedia(chat_id);
 
@@ -504,9 +601,14 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
     user.event_id = uuidv4();
     user.value = 0;
     user.plan = '';
+    user.hasPaidMain = false;
+    user.hasPaidUpsell = false;
+    user.stopRemarketing = false;
+    user.bumpHistory = {};
 
     await sendToMeta('PageView', user, user.redirect_event_id || user.event_id);
     await sendPlanMessage(chat_id);
+    await scheduleOrderBumps(chat_id);
   } catch (err) {
     console.log('START ERROR:', err.response?.data || err.message || err);
     try {
@@ -575,7 +677,23 @@ bot.on('callback_query', async (query) => {
       });
     }
 
-    // Estrutura pronta para futuro downsell
+    if (data === 'remarketing_pay_now') {
+      if (!user.plan) {
+        user.value = 15.42;
+        user.plan = 'vip';
+      }
+
+      user.event_id = uuidv4();
+      await sendToMeta('InitiateCheckout', user);
+      return await goToPayment(chat_id, user, { isUpsell: false });
+    }
+
+    if (data === 'remarketing_no') {
+      user.stopRemarketing = true;
+      cancelAllScheduledBumps(chat_id);
+      return await bot.sendMessage(chat_id, 'Tudo bem.');
+    }
+
     if (data === 'downsell_view') {
       return await bot.sendMessage(chat_id, '✅ Estrutura de downsell pronta para você personalizar depois.');
     }
@@ -649,8 +767,13 @@ app.post(PAYMENT_PATH, async (req, res) => {
     markTransactionPaid(txId);
 
     const { chat_id, user, upsell } = tx;
+    const liveUser = getUser(chat_id);
 
     if (!upsell) {
+      liveUser.hasPaidMain = true;
+      liveUser.stopRemarketing = true;
+      cancelAllScheduledBumps(chat_id);
+
       const purchaseUser = {
         ...user,
         value: tx.amount,
@@ -666,10 +789,11 @@ Seu acesso está sendo liberado...
 `);
 
       await sendUpsellMessage(chat_id);
-
-      // Futuro: se quiser chamar downsell em outra etapa, a estrutura já existe
-      // await sendDownsellMessage(chat_id);
     } else {
+      liveUser.hasPaidUpsell = true;
+      liveUser.stopRemarketing = true;
+      cancelAllScheduledBumps(chat_id);
+
       await bot.sendMessage(chat_id, `
 🚀 ACESSO TOTAL LIBERADO!
 
@@ -695,6 +819,7 @@ setInterval(() => {
 
   for (const [chat_id, user] of Object.entries(users)) {
     if (now - (user.updatedAt || user.createdAt || now) > 7 * 24 * 60 * 60 * 1000) {
+      cancelAllScheduledBumps(chat_id);
       delete users[chat_id];
     }
   }
