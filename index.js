@@ -4,153 +4,627 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const { v4: uuidv4 } = require('uuid');
 
+// ================= CONFIG =================
 const TOKEN = process.env.BOT_TOKEN;
-const BASE_URL = process.env.RENDER_EXTERNAL_URL;
+const PORT = Number(process.env.PORT || 3000);
+const BASE_URL = (process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
 
-const SYNCPAY_URL = process.env.SYNCPAY_BASE_URL;
+const SYNCPAY_URL = (process.env.SYNCPAY_BASE_URL || '').replace(/\/+$/, '');
 const CLIENT_ID = process.env.SYNCPAY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SYNCPAY_CLIENT_SECRET;
 
 const META_PIXEL_ID = process.env.META_PIXEL_ID;
 const META_TOKEN = process.env.META_TOKEN;
 
-const bot = new TelegramBot(TOKEN);
+// ================= VALIDATION =================
+if (!TOKEN) throw new Error('BOT_TOKEN não configurado');
+if (!BASE_URL) throw new Error('RENDER_EXTERNAL_URL não configurado');
+if (!SYNCPAY_URL) throw new Error('SYNCPAY_BASE_URL não configurado');
+if (!CLIENT_ID) throw new Error('SYNCPAY_CLIENT_ID não configurado');
+if (!CLIENT_SECRET) throw new Error('SYNCPAY_CLIENT_SECRET não configurado');
+
+// ================= INIT =================
+const TELEGRAM_PATH = '/telegram';
+const PAYMENT_PATH = '/webhook';
+const TELEGRAM_WEBHOOK_URL = `${BASE_URL}${TELEGRAM_PATH}`;
+
+const bot = new TelegramBot(TOKEN, { webHook: true });
 const app = express();
 app.use(bodyParser.json());
 
+// ================= MEMORY STATE =================
 const users = {};
 const transactions = {};
+const processedPayments = new Set();
+const actionLock = {};
+const processedMetaEvents = new Set();
+
 let accessToken = null;
+let accessTokenExpiresAt = 0;
 
-// ================= AUTH SYNCPAY =================
-async function getToken(){
-if(accessToken) return accessToken;
+// ================= HELPERS =================
+function nowSec() {
+  return Math.floor(Date.now() / 1000);
+}
 
-const res = await axios.post(`${SYNCPAY_URL}/api/partner/v1/auth-token`,{
-client_id: CLIENT_ID,
-client_secret: CLIENT_SECRET
-});
+function roundMoney(value) {
+  return Number(Number(value || 0).toFixed(2));
+}
 
-accessToken = res.data.access_token;
-setTimeout(()=> accessToken=null, 3500*1000);
-return accessToken;
+function formatBRL(value) {
+  return roundMoney(value).toFixed(2);
+}
+
+function safeBase64JsonDecode(encoded) {
+  try {
+    const normalized = String(encoded || '').trim();
+    if (!normalized) return {};
+    const json = Buffer.from(normalized, 'base64').toString('utf8');
+    return JSON.parse(json);
+  } catch {
+    return {};
+  }
+}
+
+function getUser(chat_id) {
+  if (!users[chat_id]) {
+    users[chat_id] = {
+      chat_id,
+      fbc: '',
+      fbp: '',
+      ip: '',
+      ua: '',
+      lang: '',
+      screen: '',
+      tz: '',
+      referrer: '',
+      host: '',
+      path: '',
+      utm_source: '',
+      utm_medium: '',
+      utm_campaign: '',
+      utm_content: '',
+      utm_term: '',
+      utm_ad: '',
+      campaign_id: '',
+      adset_id: '',
+      ad_id: '',
+      redirect_event_id: '',
+      event_id: uuidv4(),
+      value: 0,
+      plan: '',
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+  }
+
+  users[chat_id].updatedAt = Date.now();
+  return users[chat_id];
+}
+
+function mergeUser(chat_id, payload = {}) {
+  const user = getUser(chat_id);
+
+  users[chat_id] = {
+    ...user,
+    chat_id,
+    fbc: payload.fbc || user.fbc || '',
+    fbp: payload.fbp || user.fbp || '',
+    ip: payload.ip || user.ip || '',
+    ua: payload.ua || user.ua || '',
+    lang: payload.lang || user.lang || '',
+    screen: payload.screen || user.screen || '',
+    tz: payload.tz || user.tz || '',
+    referrer: payload.referrer || user.referrer || '',
+    host: payload.host || user.host || '',
+    path: payload.path || user.path || '',
+    utm_source: payload.utm_source || user.utm_source || '',
+    utm_medium: payload.utm_medium || user.utm_medium || '',
+    utm_campaign: payload.utm_campaign || user.utm_campaign || '',
+    utm_content: payload.utm_content || user.utm_content || '',
+    utm_term: payload.utm_term || user.utm_term || '',
+    utm_ad: payload.utm_ad || user.utm_ad || '',
+    campaign_id: payload.campaign_id || user.campaign_id || '',
+    adset_id: payload.adset_id || user.adset_id || '',
+    ad_id: payload.ad_id || user.ad_id || '',
+    redirect_event_id: payload.redirect_event_id || user.redirect_event_id || '',
+    updatedAt: Date.now()
+  };
+
+  return users[chat_id];
+}
+
+function lockAction(key, ttlMs = 5000) {
+  if (actionLock[key]) return false;
+  actionLock[key] = true;
+  setTimeout(() => delete actionLock[key], ttlMs);
+  return true;
+}
+
+function extractTransactionId(data) {
+  return (
+    data?.id ||
+    data?.data?.id ||
+    data?.identifier ||
+    data?.data?.identifier ||
+    data?.reference_id ||
+    data?.transaction_id ||
+    null
+  );
+}
+
+function extractPixCode(data) {
+  return (
+    data?.pix_code ||
+    data?.data?.pix_code ||
+    data?.qr_code ||
+    data?.data?.qr_code ||
+    data?.pix?.payload ||
+    data?.data?.pix?.payload ||
+    null
+  );
+}
+
+function createTransactionRecord({ txId, chat_id, user, amount, upsell = false }) {
+  transactions[txId] = {
+    txId,
+    chat_id,
+    user: { ...user },
+    amount: roundMoney(amount),
+    upsell,
+    status: 'pending',
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+}
+
+function markTransactionPaid(txId) {
+  if (!transactions[txId]) return;
+  transactions[txId].status = 'paid';
+  transactions[txId].updatedAt = Date.now();
+  transactions[txId].paidAt = Date.now();
 }
 
 // ================= META =================
-async function sendToMeta(event,user){
-try{
-await axios.post(`https://graph.facebook.com/v18.0/${META_PIXEL_ID}/events?access_token=${META_TOKEN}`,{
-data:[{
-event_name:event,
-event_time:Math.floor(Date.now()/1000),
-event_id:user.event_id,
-action_source:"website",
-user_data:{
-client_user_agent:user.ua,
-fbc:user.fbc,
-fbp:user.fbp
-},
-custom_data:{
-value:user.value||0,
-currency:"BRL"
-}
-}]
-});
-}catch(e){}
-}
+async function sendToMeta(event_name, user, overrideEventId = null) {
+  if (!META_PIXEL_ID || !META_TOKEN) return;
 
-// ================= START =================
-bot.onText(/\/start(.*)/,async(msg,match)=>{
+  const metaEventId = overrideEventId || user.event_id || uuidv4();
+  const dedupeKey = `${event_name}:${metaEventId}`;
 
-const chat_id=msg.chat.id;
+  if (processedMetaEvents.has(dedupeKey)) return;
+  processedMetaEvents.add(dedupeKey);
 
-let payload={};
-try{
-payload=JSON.parse(Buffer.from(match[1],'base64').toString());
-}catch{}
-
-users[chat_id]={
-fbc:payload.fbc||'',
-fbp:payload.fbp||'',
-ua:payload.ua||'',
-event_id:uuidv4(),
-value:0
-};
-
-await sendToMeta("PageView",users[chat_id]);
-
-bot.sendMessage(chat_id,"Escolha seu plano:",{
-reply_markup:{
-inline_keyboard:[
-[{text:"VIP R$15.42",callback_data:"vip"}]
-]
-}
-});
-
-});
-
-// ================= CALLBACK =================
-bot.on("callback_query",async(q)=>{
-
-const chat_id=q.message.chat.id;
-const user=users[chat_id];
-
-if(!user) return;
-
-if(q.data==="vip"){
-user.value=15.42;
-await sendToMeta("InitiateCheckout",user);
-
-return bot.sendMessage(chat_id,"Gerando PIX...");
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v18.0/${META_PIXEL_ID}/events?access_token=${META_TOKEN}`,
+      {
+        data: [
+          {
+            event_name,
+            event_time: nowSec(),
+            event_id: metaEventId,
+            action_source: 'website',
+            user_data: {
+              client_ip_address: user.ip || '',
+              client_user_agent: user.ua || '',
+              fbc: user.fbc || '',
+              fbp: user.fbp || ''
+            },
+            custom_data: {
+              currency: 'BRL',
+              value: roundMoney(user.value || 0),
+              utm_source: user.utm_source || '',
+              utm_medium: user.utm_medium || '',
+              utm_campaign: user.utm_campaign || '',
+              utm_content: user.utm_content || '',
+              utm_term: user.utm_term || '',
+              campaign_id: user.campaign_id || '',
+              adset_id: user.adset_id || '',
+              ad_id: user.ad_id || ''
+            }
+          }
+        ]
+      },
+      { timeout: 15000 }
+    );
+  } catch (err) {
+    processedMetaEvents.delete(dedupeKey);
+    console.log('META ERROR:', err.response?.data || err.message);
+  }
 }
 
-});
+// ================= SYNCPAY =================
+async function getToken() {
+  const now = Date.now();
 
-// ================= PAGAMENTO =================
-async function gerarPix(user){
+  if (accessToken && now < accessTokenExpiresAt - 60000) {
+    return accessToken;
+  }
 
-const token=await getToken();
+  const res = await axios.post(
+    `${SYNCPAY_URL}/api/partner/v1/auth-token`,
+    {
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET
+    },
+    {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 20000
+    }
+  );
 
-const res=await axios.post(`${SYNCPAY_URL}/api/partner/v1/cash-in`,{
-amount:user.value
-},{
-headers:{Authorization:`Bearer ${token}`}
-});
+  if (!res.data?.access_token) {
+    throw new Error(`Auth SyncPay inválido: ${JSON.stringify(res.data)}`);
+  }
 
-const tx=res.data.identifier;
-const pix=res.data.pix_code;
+  accessToken = res.data.access_token;
+  accessTokenExpiresAt = now + (Number(res.data?.expires_in || 3600) * 1000);
 
-transactions[tx]=user;
-
-return pix;
-
+  return accessToken;
 }
 
-// ================= WEBHOOK TELEGRAM =================
-app.post('/telegram',(req,res)=>{
-bot.processUpdate(req.body);
-res.sendStatus(200);
-});
+async function createSyncPayCashIn(amount) {
+  const token = await getToken();
 
-// ================= WEBHOOK PAGAMENTO =================
-app.post('/webhook',async(req,res)=>{
+  const response = await axios.post(
+    `${SYNCPAY_URL}/api/partner/v1/cash-in`,
+    { amount: roundMoney(amount) },
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 25000
+    }
+  );
 
-const data=req.body;
-const tx=data?.data?.id || data.id;
+  const data = response.data;
+  const txId = extractTransactionId(data);
+  const pixCode = extractPixCode(data);
 
-if(transactions[tx]){
-const user=transactions[tx];
+  if (!txId || !pixCode) {
+    throw new Error(`Resposta cash-in inesperada da SyncPay: ${JSON.stringify(data)}`);
+  }
 
-await sendToMeta("Purchase",user);
-
-bot.sendMessage(user.chat_id,"Pagamento confirmado!");
+  return { txId, pixCode, raw: data };
 }
 
-res.sendStatus(200);
+// ================= FLOW MESSAGES =================
+async function sendPlanMessage(chat_id) {
+  return bot.sendMessage(chat_id, `
+⬇️ VEJA COMO É O VIP POR DENTRO DIVIDIDO EM TÓPICOS PARA VOCÊ 🔴
+
+😍 OnlyFans 🔴 Vídeos raros
+😈 Privacy ✨ Lives¹⁸
+🌈 Novinhas¹⁸ ❤️ Close Friends
+👀 Inc3st0 😢 Em Público
+💕 Fetiches 🌈 Amador
+🍼 Milf’s 🔞 PROIBIDINHOS¹⁸
+😳 F4M1L1A S4c4na 💋 Ocultos¹⁸
+😡 Faveladas 🔥 KAM1LINHA
+🙈 Sexo na faculdade¹⁸
+🌈 Un1vers1t4r1as V4z4d4s¹⁸
+
+📁 +207.629 mídias no nosso VIP
+🔴 +31.735 mídias OCULTAS
+😈 + 6 Grupos secretos
+
+⚠️ sua gozada garantida ou seu dinheiro de volta!
+
+🚀 Acesso imediato!
+⏰ PROMOÇÃO ENCERRA EM 6 MINUTOS!
+💥 (9 vagas restantes)
+`, {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '⭐ 1 SEMANA 30% OFF - R$7.42', callback_data: 'plan_week' }],
+        [{ text: '🔥 VIP VITALÍCIO - R$15.42', callback_data: 'plan_vip' }],
+        [{ text: '🌸 VITALÍCIO + PASTAS - R$23.42', callback_data: 'plan_full' }]
+      ]
+    }
+  });
+}
+
+async function sendOrderBumpMessage(chat_id) {
+  return bot.sendMessage(chat_id, `
+🚫 LIVES BANIDAS 🔥
+
+😈 Não perca o acesso das Lives mais exclusivas do Brasil!
+
+📁 SEPARADAS POR PASTAS
+💎 CONTEÚDOS ATUALIZADOS DIARIAMENTE
+
+🔥 ADICIONE POR APENAS R$4,99
+`, {
+    reply_markup: {
+      inline_keyboard: [[
+        { text: '✅ ADICIONAR', callback_data: 'bump_yes' },
+        { text: '❌ NÃO QUERO', callback_data: 'bump_no' }
+      ]]
+    }
+  });
+}
+
+async function sendUpsellMessage(chat_id) {
+  return bot.sendMessage(chat_id, `
+🔒 Tarifa de Segurança – Verificação Obrigatória
+
+Nós prezamos pela segurança dos membros.
+
+💳 R$10 (100% reembolsável)
+
+⚠️ Caso não pague, o acesso pode ser bloqueado.
+`, {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '🟢 PAGAR TARIFA R$10', callback_data: 'upsell_buy' }]
+      ]
+    }
+  });
+}
+
+// ================= PAYMENT =================
+async function goToPayment(chat_id, user, isUpsell = false, forcedAmount = null) {
+  try {
+    const amount = roundMoney(forcedAmount ?? user.value);
+
+    if (!amount || amount <= 0) {
+      throw new Error(`Valor inválido para cobrança: ${amount}`);
+    }
+
+    const { txId, pixCode, raw } = await createSyncPayCashIn(amount);
+
+    createTransactionRecord({
+      txId,
+      chat_id,
+      user,
+      amount,
+      upsell: isUpsell
+    });
+
+    console.log('SYNCPAY CASHIN OK:', raw);
+
+    await bot.sendMessage(chat_id, `
+💳 PAGAMENTO PIX
+
+Valor: R$ ${formatBRL(amount)}
+
+${pixCode}
+`);
+  } catch (err) {
+    console.log('PAYMENT ERROR FULL:', {
+      message: err.message,
+      status: err.response?.status,
+      data: err.response?.data
+    });
+
+    await bot.sendMessage(chat_id, '❌ Erro ao gerar pagamento.');
+  }
+}
+
+// ================= TELEGRAM START =================
+bot.onText(/\/start(.*)/, async (msg, match) => {
+  try {
+    const chat_id = msg.chat.id;
+    const param = match?.[1]?.trim() || '';
+    const payload = safeBase64JsonDecode(param);
+
+    const user = mergeUser(chat_id, payload);
+    user.chat_id = chat_id;
+    user.event_id = uuidv4();
+    user.value = 0;
+    user.plan = '';
+
+    await sendToMeta('PageView', user, user.redirect_event_id || user.event_id);
+    await sendPlanMessage(chat_id);
+  } catch (err) {
+    console.log('START ERROR:', err.response?.data || err.message || err);
+    try {
+      await bot.sendMessage(msg.chat.id, '❌ Erro ao iniciar.');
+    } catch {}
+  }
 });
 
-// ================= START SERVER =================
-app.listen(process.env.PORT||3000,async()=>{
-await bot.setWebHook(`${BASE_URL}/telegram`);
-console.log("BOT ONLINE");
+// ================= TELEGRAM CALLBACK =================
+bot.on('callback_query', async (query) => {
+  try {
+    if (!query?.message?.chat?.id) return;
+
+    const chat_id = query.message.chat.id;
+    const data = query.data;
+    const user = getUser(chat_id);
+
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+
+    const lockKey = `${chat_id}:${data}`;
+    if (!lockAction(lockKey)) return;
+
+    if (data === 'plan_week') {
+      user.value = 7.42;
+      user.plan = 'week';
+      user.event_id = uuidv4();
+      await sendToMeta('InitiateCheckout', user);
+      return await sendOrderBumpMessage(chat_id);
+    }
+
+    if (data === 'plan_vip') {
+      user.value = 15.42;
+      user.plan = 'vip';
+      user.event_id = uuidv4();
+      await sendToMeta('InitiateCheckout', user);
+      return await sendOrderBumpMessage(chat_id);
+    }
+
+    if (data === 'plan_full') {
+      user.value = 23.42;
+      user.plan = 'full';
+      user.event_id = uuidv4();
+      await sendToMeta('InitiateCheckout', user);
+      return await sendOrderBumpMessage(chat_id);
+    }
+
+    if (data === 'bump_yes') {
+      user.value = roundMoney(Number(user.value || 0) + 4.99);
+      return await goToPayment(chat_id, user, false);
+    }
+
+    if (data === 'bump_no') {
+      return await goToPayment(chat_id, user, false);
+    }
+
+    if (data === 'upsell_buy') {
+      const upsellUser = {
+        ...user,
+        value: 10,
+        event_id: uuidv4()
+      };
+
+      return await goToPayment(chat_id, upsellUser, true, 10);
+    }
+  } catch (err) {
+    console.log('CALLBACK ERROR:', err.response?.data || err.message || err);
+    try {
+      if (query?.message?.chat?.id) {
+        await bot.sendMessage(query.message.chat.id, '❌ Erro ao processar sua ação.');
+      }
+    } catch {}
+  }
+});
+
+// ================= ROUTE TELEGRAM =================
+app.post(TELEGRAM_PATH, (req, res) => {
+  try {
+    bot.processUpdate(req.body);
+    res.sendStatus(200);
+  } catch (err) {
+    console.log('TELEGRAM ROUTE ERROR:', err);
+    res.sendStatus(200);
+  }
+});
+
+// ================= ROUTE PAYMENT WEBHOOK =================
+app.post(PAYMENT_PATH, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const data = body.data || body;
+    const eventHeader = req.headers['event'];
+
+    const txId =
+      data?.identifier ||
+      data?.id ||
+      body?.identifier ||
+      body?.id;
+
+    const status =
+      data?.status ||
+      body?.status ||
+      '';
+
+    if (!txId) return res.sendStatus(200);
+
+    if (processedPayments.has(txId)) {
+      return res.sendStatus(200);
+    }
+
+    const tx = transactions[txId];
+    if (!tx) {
+      console.log('WEBHOOK TX NOT FOUND:', { txId, eventHeader, status, body });
+      return res.sendStatus(200);
+    }
+
+    const paid =
+      status === 'completed' ||
+      status === 'paid' ||
+      status === 'approved' ||
+      body?.paid === true;
+
+    if (!paid) {
+      console.log('WEBHOOK NOT PAID YET:', { txId, eventHeader, status });
+      return res.sendStatus(200);
+    }
+
+    processedPayments.add(txId);
+    markTransactionPaid(txId);
+
+    const { chat_id, user, upsell } = tx;
+
+    if (!upsell) {
+      const purchaseUser = {
+        ...user,
+        value: tx.amount,
+        event_id: uuidv4()
+      };
+
+      await sendToMeta('Purchase', purchaseUser);
+
+      await bot.sendMessage(chat_id, `
+✅ PAGAMENTO CONFIRMADO!
+
+Seu acesso está sendo liberado...
+`);
+
+      await sendUpsellMessage(chat_id);
+    } else {
+      await bot.sendMessage(chat_id, `
+🚀 ACESSO TOTAL LIBERADO!
+
+Aproveite todo o conteúdo 🔥
+`);
+    }
+
+    return res.sendStatus(200);
+  } catch (err) {
+    console.log('WEBHOOK ERROR:', err.response?.data || err.message || err);
+    return res.sendStatus(200);
+  }
+});
+
+// ================= HEALTH =================
+app.get('/', (req, res) => {
+  res.status(200).send('BOT ONLINE');
+});
+
+// ================= CLEANUP =================
+setInterval(() => {
+  const now = Date.now();
+
+  for (const [chat_id, user] of Object.entries(users)) {
+    if (now - (user.updatedAt || user.createdAt || now) > 7 * 24 * 60 * 60 * 1000) {
+      delete users[chat_id];
+    }
+  }
+
+  for (const [txId, tx] of Object.entries(transactions)) {
+    if (now - (tx.updatedAt || tx.createdAt || now) > 12 * 60 * 60 * 1000) {
+      delete transactions[txId];
+    }
+  }
+}, 30 * 60 * 1000);
+
+// ================= TELEGRAM WEBHOOK SETUP =================
+async function setupTelegramWebhook() {
+  try {
+    await bot.deleteWebHook().catch(() => {});
+    await bot.setWebHook(TELEGRAM_WEBHOOK_URL);
+    const info = await bot.getWebHookInfo();
+    console.log('TELEGRAM WEBHOOK OK:', info);
+  } catch (err) {
+    console.log('TELEGRAM WEBHOOK ERROR:', err.response?.data || err.message || err);
+  }
+}
+
+// ================= SAFETY =================
+process.on('unhandledRejection', (err) => {
+  console.log('UNHANDLED REJECTION:', err);
+});
+
+process.on('uncaughtException', (err) => {
+  console.log('UNCAUGHT EXCEPTION:', err);
+});
+
+// ================= SERVER =================
+app.listen(PORT, async () => {
+  console.log(`BOT ONLINE NA PORTA ${PORT}`);
+  await setupTelegramWebhook();
 });
