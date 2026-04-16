@@ -17,8 +17,14 @@ const META_PIXEL_ID = process.env.META_PIXEL_ID;
 const META_TOKEN = process.env.META_TOKEN;
 
 // ================= VIDEOS =================
-const VIDEO_START = 'BAACAgEAAxkBAANPaeEyKWxDl5OYK0fz_ot58uTFo0MAAh8GAALh6wlH_G2fDxK1Tkk7BA';
-const VIDEO_BUMP = 'BAACAgEAAxkBAANTaeEyOVedIBOu6G7QfxTqnBBGZjsAAiAGAALh6wlHlAU-q8O6aMo7BA';
+// Depois de capturar no seu próprio bot, cole os IDs aqui.
+// Pode deixar vazio por enquanto.
+const VIDEO_START = process.env.VIDEO_START_FILE_ID || '';
+const VIDEO_BUMP = process.env.VIDEO_BUMP_FILE_ID || '';
+
+// ================= CAPTURE MODE =================
+// true = captura file_id nos logs quando você enviar mídia pro bot
+const CAPTURE_FILE_ID_MODE = true;
 
 // ================= VALIDATION =================
 if (!TOKEN) throw new Error('BOT_TOKEN não configurado');
@@ -296,10 +302,12 @@ async function createSyncPayCashIn(amount) {
 
 // ================= FLOW MESSAGES =================
 async function sendPlanMessage(chat_id) {
-  try {
-    await bot.sendVideo(chat_id, VIDEO_START);
-  } catch (err) {
-    console.log('START VIDEO ERROR:', err.response?.data || err.message || err);
+  if (VIDEO_START) {
+    try {
+      await bot.sendVideo(chat_id, VIDEO_START);
+    } catch (err) {
+      console.log('START VIDEO ERROR:', err.response?.data || err.message || err);
+    }
   }
 
   return bot.sendMessage(chat_id, `
@@ -337,10 +345,12 @@ async function sendPlanMessage(chat_id) {
 }
 
 async function sendOrderBumpMessage(chat_id) {
-  try {
-    await bot.sendVideo(chat_id, VIDEO_BUMP);
-  } catch (err) {
-    console.log('BUMP VIDEO ERROR:', err.response?.data || err.message || err);
+  if (VIDEO_BUMP) {
+    try {
+      await bot.sendVideo(chat_id, VIDEO_BUMP);
+    } catch (err) {
+      console.log('BUMP VIDEO ERROR:', err.response?.data || err.message || err);
+    }
   }
 
   return bot.sendMessage(chat_id, `
@@ -439,6 +449,31 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
     try {
       await bot.sendMessage(msg.chat.id, '❌ Erro ao iniciar.');
     } catch {}
+  }
+});
+
+// ================= TEMP FILE_ID CAPTURE =================
+bot.on('message', async (msg) => {
+  if (!CAPTURE_FILE_ID_MODE) return;
+
+  try {
+    const chatId = msg.chat.id;
+
+    if (msg.video) {
+      console.log('CAPTURE VIDEO FILE_ID:', msg.video.file_id);
+      console.log('CAPTURE VIDEO FILE_UNIQUE_ID:', msg.video.file_unique_id);
+      await bot.sendMessage(chatId, `VIDEO FILE_ID:\n${msg.video.file_id}`);
+      return;
+    }
+
+    if (msg.document) {
+      console.log('CAPTURE DOCUMENT FILE_ID:', msg.document.file_id);
+      console.log('CAPTURE DOCUMENT FILE_UNIQUE_ID:', msg.document.file_unique_id);
+      await bot.sendMessage(chatId, `DOCUMENT FILE_ID:\n${msg.document.file_id}`);
+      return;
+    }
+  } catch (err) {
+    console.log('CAPTURE FILE_ID ERROR:', err.response?.data || err.message || err);
   }
 });
 
