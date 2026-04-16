@@ -16,6 +16,10 @@ const CLIENT_SECRET = process.env.SYNCPAY_CLIENT_SECRET;
 const META_PIXEL_ID = process.env.META_PIXEL_ID;
 const META_TOKEN = process.env.META_TOKEN;
 
+// ================= VIDEOS =================
+const VIDEO_START = 'BAACAgEAAxkBAANPaeEyKWxDl5OYK0fz_ot58uTFo0MAAh8GAALh6wlH_G2fDxK1Tkk7BA';
+const VIDEO_BUMP = 'BAACAgEAAxkBAANTaeEyOVedIBOu6G7QfxTqnBBGZjsAAiAGAALh6wlHlAU-q8O6aMo7BA';
+
 // ================= VALIDATION =================
 if (!TOKEN) throw new Error('BOT_TOKEN não configurado');
 if (!BASE_URL) throw new Error('RENDER_EXTERNAL_URL não configurado');
@@ -292,6 +296,12 @@ async function createSyncPayCashIn(amount) {
 
 // ================= FLOW MESSAGES =================
 async function sendPlanMessage(chat_id) {
+  try {
+    await bot.sendVideo(chat_id, VIDEO_START);
+  } catch (err) {
+    console.log('START VIDEO ERROR:', err.response?.data || err.message || err);
+  }
+
   return bot.sendMessage(chat_id, `
 ⬇️ VEJA COMO É O VIP POR DENTRO DIVIDIDO EM TÓPICOS PARA VOCÊ 🔴
 
@@ -327,6 +337,12 @@ async function sendPlanMessage(chat_id) {
 }
 
 async function sendOrderBumpMessage(chat_id) {
+  try {
+    await bot.sendVideo(chat_id, VIDEO_BUMP);
+  } catch (err) {
+    console.log('BUMP VIDEO ERROR:', err.response?.data || err.message || err);
+  }
+
   return bot.sendMessage(chat_id, `
 🚫 LIVES BANIDAS 🔥
 
