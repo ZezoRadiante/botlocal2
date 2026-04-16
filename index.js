@@ -13,7 +13,8 @@ const SYNCPAY_URL = (process.env.SYNCPAY_BASE_URL || '').replace(/\/+$/, '');
 const CLIENT_ID = process.env.SYNCPAY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SYNCPAY_CLIENT_SECRET;
 
-const META_PIXEL_ID = process.env.META_PIXEL_ID;
+// Novo pixel já implementado
+const META_PIXEL_ID = '1505014021315132';
 const META_TOKEN = process.env.META_TOKEN;
 
 // ================= MEDIA =================
@@ -33,7 +34,6 @@ Se você não quer seguir com a oferta principal, temos uma condição especial 
 };
 
 // ================= BUMP SCHEDULE =================
-// 12 bumps automáticos
 const ORDER_BUMP_SCHEDULES = [
   { key: 'bump_1', delayMs: 10 * 60 * 1000 },
   { key: 'bump_2', delayMs: 20 * 60 * 1000 },
@@ -55,6 +55,7 @@ if (!BASE_URL) throw new Error('RENDER_EXTERNAL_URL não configurado');
 if (!SYNCPAY_URL) throw new Error('SYNCPAY_BASE_URL não configurado');
 if (!CLIENT_ID) throw new Error('SYNCPAY_CLIENT_ID não configurado');
 if (!CLIENT_SECRET) throw new Error('SYNCPAY_CLIENT_SECRET não configurado');
+if (!META_TOKEN) throw new Error('META_TOKEN não configurado');
 
 // ================= INIT =================
 const TELEGRAM_PATH = '/telegram';
@@ -305,8 +306,6 @@ ${getScheduledBumpCopy(index)}
 
 // ================= META =================
 async function sendToMeta(event_name, user, overrideEventId = null) {
-  if (!META_PIXEL_ID || !META_TOKEN) return;
-
   const metaEventId = overrideEventId || user.event_id || uuidv4();
   const dedupeKey = `${event_name}:${metaEventId}`;
 
@@ -606,7 +605,7 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
     user.stopRemarketing = false;
     user.bumpHistory = {};
 
-    await sendToMeta('PageView', user, user.redirect_event_id || user.event_id);
+    await sendToMeta('ViewContent', user, user.redirect_event_id || user.event_id);
     await sendPlanMessage(chat_id);
     await scheduleOrderBumps(chat_id);
   } catch (err) {
