@@ -8,6 +8,8 @@ const { v4: uuidv4 } = require('uuid');
 const TOKEN = process.env.BOT_TOKEN;
 const PORT = Number(process.env.PORT || 3000);
 
+const RENDER_EXTERNAL_URL = (process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
+
 const SYNCPAY_BASE_URL = (process.env.SYNCPAY_BASE_URL || '').replace(/\/+$/, '');
 const SYNCPAY_CLIENT_ID = process.env.SYNCPAY_CLIENT_ID;
 const SYNCPAY_CLIENT_SECRET = process.env.SYNCPAY_CLIENT_SECRET;
@@ -17,12 +19,17 @@ const META_TOKEN = process.env.META_TOKEN;
 
 // ================= VALIDATION =================
 if (!TOKEN) throw new Error('BOT_TOKEN não configurado');
+if (!RENDER_EXTERNAL_URL) throw new Error('RENDER_EXTERNAL_URL não configurado');
 if (!SYNCPAY_BASE_URL) throw new Error('SYNCPAY_BASE_URL não configurado');
 if (!SYNCPAY_CLIENT_ID) throw new Error('SYNCPAY_CLIENT_ID não configurado');
 if (!SYNCPAY_CLIENT_SECRET) throw new Error('SYNCPAY_CLIENT_SECRET não configurado');
 
 // ================= INIT =================
-const bot = new TelegramBot(TOKEN, { polling: true });
+const TELEGRAM_PATH = '/telegram-webhook';
+const PAYMENT_PATH = '/webhook';
+const TELEGRAM_WEBHOOK_URL = `${RENDER_EXTERNAL_URL}${TELEGRAM_PATH}`;
+
+const bot = new TelegramBot(TOKEN, { webHook: true });
 
 const app = express();
 app.use(bodyParser.json());
@@ -105,14 +112,12 @@ async function sendToMeta(event_name, user) {
 async function getSyncPayAccessToken() {
   const now = Date.now();
 
-  if (syncpayToken && now < syncpayTokenExpiresAt - 60_000) {
+  if (syncpayToken && now < syncpayTokenExpiresAt - 60000) {
     return syncpayToken;
   }
 
-  const url = `${SYNCPAY_BASE_URL}/api/partner/v1/auth-token`;
-
   const response = await axios.post(
-    url,
+    `${SYNCPAY_BASE_URL}/api/partner/v1/auth-token`,
     {
       client_id: SYNCPAY_CLIENT_ID,
       client_secret: SYNCPAY_CLIENT_SECRET
@@ -178,7 +183,6 @@ function extractPixCode(data) {
 async function createSyncPayCashIn(amount) {
   const payload = { amount: roundMoney(amount) };
 
-  // endpoint inferido da árvore atual da documentação "Pix - CashIn"
   const data = await syncpayRequest('POST', '/api/partner/v1/cash-in', payload);
 
   const txId = extractTransactionId(data);
@@ -191,7 +195,7 @@ async function createSyncPayCashIn(amount) {
   return { txId, pixCode, raw: data };
 }
 
-// ================= START =================
+// ================= TELEGRAM HANDLERS =================
 bot.onText(/\/start(.*)/, async (msg, match) => {
   try {
     const chat_id = msg.chat.id;
@@ -252,7 +256,6 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
   }
 });
 
-// ================= FLOW =================
 bot.on('callback_query', async (query) => {
   try {
     if (!query?.message?.chat?.id) return;
@@ -353,8 +356,14 @@ ${pixCode}
   }
 }
 
-// ================= WEBHOOK =================
-app.post('/webhook', async (req, res) => {
+// ================= ROTA TELEGRAM =================
+app.post(TELEGRAM_PATH, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
+// ================= WEBHOOK PAGAMENTO =================
+app.post(PAYMENT_PATH, async (req, res) => {
   try {
     const eventHeader = req.headers['event'];
     const body = req.body || {};
@@ -366,7 +375,6 @@ app.post('/webhook', async (req, res) => {
     if (!txId) return res.sendStatus(200);
     if (processedPayments.has(txId)) return res.sendStatus(200);
 
-    // SyncPay usa cashin.create e cashin.update nos webhooks
     if (eventHeader === 'cashin.update' && status === 'completed' && transactions[txId]) {
       processedPayments.add(txId);
 
@@ -412,6 +420,23 @@ Aproveite todo o conteúdo 🔥
   }
 });
 
+// ================= HEALTHCHECK =================
+app.get('/', (req, res) => {
+  res.status(200).send('BOT ONLINE');
+});
+
+// ================= TELEGRAM WEBHOOK REGISTER =================
+async function setupTelegramWebhook() {
+  try {
+    await bot.deleteWebHook().catch(() => {});
+    await bot.setWebHook(TELEGRAM_WEBHOOK_URL);
+    const info = await bot.getWebHookInfo();
+    console.log('TELEGRAM WEBHOOK OK:', info);
+  } catch (err) {
+    console.log('TELEGRAM WEBHOOK ERROR:', err.response?.data || err.message || err);
+  }
+}
+
 // ================= SAFETY =================
 process.on('unhandledRejection', (err) => {
   console.log('UNHANDLED REJECTION:', err);
@@ -422,6 +447,7 @@ process.on('uncaughtException', (err) => {
 });
 
 // ================= SERVER =================
-app.listen(PORT, () => {
-  console.log(`BOT PRO ONLINE NA PORTA ${PORT}`);
+app.listen(PORT, async () => {
+  console.log(`BOT ONLINE NA PORTA ${PORT}`);
+  await setupTelegramWebhook();
 });
