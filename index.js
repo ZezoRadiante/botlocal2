@@ -1,4 +1,3 @@
-// ================= IMPORTS =================
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const express = require('express');
@@ -71,12 +70,12 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
     fbp: payload.fbp || "",
     ip: payload.ip || "",
     ua: payload.ua || "",
-    event_id,
-    value: 23.42 // default
+    event_id
   };
 
   await sendToMeta("PageView", users[chat_id]);
 
+  // 🔥 MENSAGEM PRINCIPAL + PLANOS
   await bot.sendMessage(chat_id, `
 ⬇️ VEJA COMO É O VIP POR DENTRO DIVIDIDO EM TÓPICOS PARA VOCÊ 🔴
 
@@ -95,20 +94,17 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
 🔴 +31.735 mídias OCULTAS
 😈 + 6 Grupos secretos
 
-⚠️ sua gozada garantida ou seu dinheiro de volta! ⏱️
+⚠️ sua gozada garantida ou seu dinheiro de volta!
 
 🚀 Acesso imediato!
 ⏰ PROMOÇÃO ENCERRA EM 6 MINUTOS!
-💥 (9 vagas restantes) 💥
-
-⚠️ Esta conversa pode sumir em alguns minutos! ⏱️
+💥 (9 vagas restantes)
 `, {
     reply_markup: {
       inline_keyboard: [
-        [{ text: "🔥 ENTRAR AGORA", callback_data: "start" }],
-        [{ text: "⭐ 1 SEMANA 30% OFF ⭐ por R$ 7.42", callback_data: "plan_week" }],
-        [{ text: "🔥 VIP Vitalício 🔥 por R$ 15.42", callback_data: "plan_lifetime" }],
-        [{ text: "🌸 Vitalício + PASTAS SECRETAS 📁 por R$ 23.42", callback_data: "plan_full" }]
+        [{ text: "⭐ 1 SEMANA 30% OFF - R$7.42", callback_data: "plan_week" }],
+        [{ text: "🔥 VIP VITALÍCIO - R$15.42", callback_data: "plan_vip" }],
+        [{ text: "🌸 VITALÍCIO + PASTAS - R$23.42", callback_data: "plan_full" }]
       ]
     }
   });
@@ -118,29 +114,24 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
 bot.on("callback_query", async (query) => {
   const chat_id = query.message.chat.id;
   const user = users[chat_id];
-  if (!user) return;
 
-  // seleção de plano
-  if (query.data === "plan_week") user.value = 7.42;
-  if (query.data === "plan_lifetime") user.value = 15.42;
-  if (query.data === "plan_full") user.value = 23.42;
+  // ================= PLANOS =================
+  if (query.data.startsWith("plan_")) {
 
-  // iniciar checkout
-  if (
-    query.data === "start" ||
-    query.data === "plan_week" ||
-    query.data === "plan_lifetime" ||
-    query.data === "plan_full"
-  ) {
+    if (query.data === "plan_week") user.value = 7.42;
+    if (query.data === "plan_vip") user.value = 15.42;
+    if (query.data === "plan_full") user.value = 23.42;
+
     await sendToMeta("InitiateCheckout", user);
 
+    // 🔥 ORDER BUMP
     await bot.sendMessage(chat_id, `
 🚫 LIVES BANIDAS 🔥
 
-😈 Não perca o acesso das Lives mais exclusivas do Brasil! 🇧🇷
+😈 Não perca o acesso das Lives mais exclusivas do Brasil!
 
 📁 SEPARADAS POR PASTAS
-💎 CONTEÚDOS ATUALIZADOS
+💎 CONTEÚDOS ATUALIZADOS DIARIAMENTE
 
 🔥 ADICIONE POR APENAS R$4,99
 `, {
@@ -153,70 +144,103 @@ bot.on("callback_query", async (query) => {
     });
   }
 
-  // order bump
-  if (query.data === "bump_yes") user.value += 4.99;
-  if (query.data === "bump_no") {}
-
-  if (query.data === "bump_yes" || query.data === "bump_no") {
-    await bot.sendMessage(chat_id, `
-🔒 Tarifa de Segurança – Verificação
-
-💳 R$10 (reembolsável)
-`, {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "PAGAR", callback_data: "pay" }]
-        ]
-      }
-    });
+  // ================= ORDER BUMP =================
+  if (query.data === "bump_yes") {
+    user.value += 4.99;
+    return goToPayment(chat_id, user);
   }
 
-  // gerar PIX
-  if (query.data === "pay") {
-    try {
-      const final_price = Number(user.value) + 10;
+  if (query.data === "bump_no") {
+    return goToPayment(chat_id, user);
+  }
 
-      const response = await axios.post(PIX_API, {
-        amount: final_price
-      });
+  // ================= UPSELL =================
+  if (query.data === "upsell_buy") {
 
-      const tx_id = response.data.id;
+    const response = await axios.post(PIX_API, {
+      amount: 10
+    });
 
-      transactions[tx_id] = { chat_id, user };
+    const tx_id = response.data.id;
 
-      await bot.sendMessage(chat_id, `
-💳 PAGAMENTO PIX
+    transactions[tx_id] = { chat_id, user, upsell: true };
 
-Valor: R$ ${final_price.toFixed(2)}
+    await bot.sendMessage(chat_id, `
+🔥 UPSELL VIP 🔥
+
+💳 R$10
 
 ${response.data.pix_code}
 `);
-    } catch (err) {
-      console.log(err.message);
-      await bot.sendMessage(chat_id, "Erro ao gerar pagamento.");
-    }
   }
 });
+
+// ================= PAGAMENTO =================
+async function goToPayment(chat_id, user) {
+
+  const response = await axios.post(PIX_API, {
+    amount: user.value
+  });
+
+  const tx_id = response.data.id;
+
+  transactions[tx_id] = { chat_id, user };
+
+  await bot.sendMessage(chat_id, `
+💳 PAGAMENTO PIX
+
+Valor: R$ ${user.value}
+
+${response.data.pix_code}
+`);
+}
 
 // ================= WEBHOOK =================
 app.post("/webhook", async (req, res) => {
   const { id, status } = req.body;
 
   if (status === "paid" && transactions[id]) {
-    const { chat_id, user } = transactions[id];
+    const { chat_id, user, upsell } = transactions[id];
 
-    await sendToMeta("Purchase", {
-      ...user,
-      value: user.value + 10
-    });
+    // ================= COMPRA PRINCIPAL =================
+    if (!upsell) {
+      await sendToMeta("Purchase", user);
 
-    await bot.sendMessage(chat_id, "✅ ACESSO LIBERADO");
+      await bot.sendMessage(chat_id, `
+✅ PAGAMENTO CONFIRMADO!
+
+Seu acesso está sendo liberado...
+`);
+
+      // 🔥 UPSELL APÓS COMPRA
+      await bot.sendMessage(chat_id, `
+🔒 Tarifa de Segurança – Verificação Obrigatória
+
+Nós prezamos pela segurança dos membros.
+
+💳 R$10 (100% reembolsável)
+
+⚠️ Caso não pague, o acesso pode ser bloqueado.
+`, {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "🟢 PAGAR TARIFA R$10", callback_data: "upsell_buy" }]
+          ]
+        }
+      });
+
+    } else {
+      // ================= UPSELL CONCLUÍDO =================
+      await bot.sendMessage(chat_id, `
+🚀 ACESSO TOTAL LIBERADO!
+
+Aproveite todo o conteúdo 🔥
+`);
+    }
   }
 
   res.sendStatus(200);
 });
 
 // ================= SERVER =================
-app.listen(3000, () => {
-  console.log("BOT PRO ONLINE");
-});
+app.listen(3000, () => console.log("BOT PRO ONLINE"));
