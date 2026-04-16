@@ -16,10 +16,13 @@ const bot = new TelegramBot(TOKEN, { polling: true });
 const app = express();
 app.use(bodyParser.json());
 
+// ================= STATE =================
 const users = {};
 const transactions = {};
+const processedPayments = new Set(); // 🔥 idempotência webhook
+const actionLock = {}; // 🔥 anti double click
 
-// ================= HELPERS =================
+// ================= SAFE USER =================
 function getUser(chat_id) {
   if (!users[chat_id]) {
     users[chat_id] = {
@@ -44,196 +47,238 @@ async function sendToMeta(event_name, user) {
           {
             event_name,
             event_time: Math.floor(Date.now() / 1000),
-            event_id: user.event_id,
+            event_id: user.event_id || uuidv4(),
             action_source: "website",
             user_data: {
-              client_ip_address: user.ip,
-              client_user_agent: user.ua,
-              fbc: user.fbc,
-              fbp: user.fbp
+              client_ip_address: user.ip || "",
+              client_user_agent: user.ua || "",
+              fbc: user.fbc || "",
+              fbp: user.fbp || ""
             },
             custom_data: {
               currency: "BRL",
-              value: user.value || 0
+              value: Number(user.value || 0)
             }
           }
         ]
       }
     );
   } catch (err) {
-    console.log("Erro Meta:", err.response?.data || err.message);
+    console.log("META ERROR:", err.response?.data || err.message);
   }
 }
 
 // ================= START =================
 bot.onText(/\/start(.*)/, async (msg, match) => {
-  const chat_id = msg.chat.id;
-
-  let payload = {};
-
   try {
-    const param = match[1]?.trim();
-    if (param) {
-      payload = JSON.parse(Buffer.from(param, "base64").toString());
-    }
-  } catch {}
+    const chat_id = msg.chat.id;
 
-  const event_id = uuidv4();
+    let payload = {};
+    try {
+      const param = match[1]?.trim();
+      if (param) {
+        payload = JSON.parse(Buffer.from(param, "base64").toString());
+      }
+    } catch {}
 
-  users[chat_id] = {
-    fbc: payload.fbc || "",
-    fbp: payload.fbp || "",
-    ip: payload.ip || "",
-    ua: payload.ua || "",
-    event_id,
-    value: 0
-  };
+    users[chat_id] = {
+      fbc: payload.fbc || "",
+      fbp: payload.fbp || "",
+      ip: payload.ip || "",
+      ua: payload.ua || "",
+      event_id: uuidv4(),
+      value: 0
+    };
 
-  await sendToMeta("PageView", users[chat_id]);
+    await sendToMeta("PageView", users[chat_id]);
 
-  await bot.sendMessage(chat_id, `
-⬇️ VEJA COMO É O VIP POR DENTRO 🔴
-
-📁 +200k mídias
-🔴 conteúdo atualizado
-🔥 acesso imediato
-
-⚠️ promoção por tempo limitado
-`, {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "⭐ 1 SEMANA - R$7.42", callback_data: "plan_week" }],
-        [{ text: "🔥 VIP VITALÍCIO - R$15.42", callback_data: "plan_vip" }],
-        [{ text: "🌸 VIP COMPLETO - R$23.42", callback_data: "plan_full" }]
-      ]
-    }
-  });
-});
-
-// ================= FLOW =================
-bot.on("callback_query", async (query) => {
-  const chat_id = query.message.chat.id;
-  const user = getUser(chat_id);
-
-  // ================= PLANOS =================
-  if (query.data.startsWith("plan_")) {
-
-    if (query.data === "plan_week") user.value = 7.42;
-    if (query.data === "plan_vip") user.value = 15.42;
-    if (query.data === "plan_full") user.value = 23.42;
-
-    await sendToMeta("InitiateCheckout", user);
-
-    await bot.sendMessage(chat_id, `
-🚫 ORDER BUMP
-
-Adicione acesso extra por apenas R$4,99
-`, {
+    await bot.sendMessage(chat_id, "Bem-vindo!", {
       reply_markup: {
-        inline_keyboard: [[
-          { text: "✅ ADICIONAR", callback_data: "bump_yes" },
-          { text: "❌ NÃO QUERO", callback_data: "bump_no" }
-        ]]
+        inline_keyboard: [
+          [{ text: "⭐ 7 DIAS - R$7.42", callback_data: "plan_week" }],
+          [{ text: "🔥 VIP - R$15.42", callback_data: "plan_vip" }],
+          [{ text: "💎 FULL - R$23.42", callback_data: "plan_full" }]
+        ]
       }
     });
+
+  } catch (err) {
+    console.log("START ERROR:", err);
   }
+});
 
-  // ================= ORDER BUMP =================
-  if (query.data === "bump_yes") {
-    user.value = (user.value || 0) + 4.99;
-    return goToPayment(chat_id, user);
-  }
+// ================= CALLBACK =================
+bot.on("callback_query", async (query) => {
+  try {
+    if (!query?.message?.chat?.id) return;
 
-  if (query.data === "bump_no") {
-    return goToPayment(chat_id, user);
-  }
+    const chat_id = query.message.chat.id;
+    const data = query.data;
 
-  // ================= UPSELL =================
-  if (query.data === "upsell_buy") {
+    const user = getUser(chat_id);
 
-    const response = await axios.post(PIX_API, {
-      amount: 10
-    });
+    // 🔥 remove loading do Telegram
+    await bot.answerCallbackQuery(query.id).catch(() => {});
 
-    const tx_id = response.data.id;
+    // ================= LOCK =================
+    const lockKey = `${chat_id}:${data}`;
+    if (actionLock[lockKey]) return;
+    actionLock[lockKey] = true;
 
-    transactions[tx_id] = { chat_id, user, upsell: true };
+    setTimeout(() => {
+      delete actionLock[lockKey];
+    }, 5000);
 
-    await bot.sendMessage(chat_id, `
-🔥 UPSELL VIP
+    // ================= PLANOS =================
+    if (data.startsWith("plan_")) {
+
+      if (data === "plan_week") user.value = 7.42;
+      if (data === "plan_vip") user.value = 15.42;
+      if (data === "plan_full") user.value = 23.42;
+
+      await sendToMeta("InitiateCheckout", user);
+
+      return bot.sendMessage(chat_id, `
+🚫 ORDER BUMP
+
+Adicionar por R$4,99?
+`, {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "✅ ADICIONAR", callback_data: "bump_yes" },
+            { text: "❌ NÃO QUERO", callback_data: "bump_no" }
+          ]]
+        }
+      });
+    }
+
+    // ================= BUMP =================
+    if (data === "bump_yes") {
+
+      user.value = Number(user.value || 0) + 4.99;
+
+      return goToPayment(chat_id, user);
+    }
+
+    if (data === "bump_no") {
+      return goToPayment(chat_id, user);
+    }
+
+    // ================= UPSELL =================
+    if (data === "upsell_buy") {
+
+      try {
+        const response = await axios.post(PIX_API, {
+          amount: 10
+        });
+
+        const tx_id = response.data.id;
+
+        transactions[tx_id] = { chat_id, user, upsell: true };
+
+        return bot.sendMessage(chat_id, `
+🔥 UPSELL
 
 💳 R$10
 
 ${response.data.pix_code}
 `);
+      } catch (err) {
+        console.log("PIX ERROR:", err.response?.data || err.message);
+        return bot.sendMessage(chat_id, "Erro ao gerar PIX.");
+      }
+    }
+
+  } catch (err) {
+    console.log("CALLBACK GLOBAL ERROR:", err);
   }
 });
 
-// ================= PAGAMENTO =================
+// ================= PAYMENT =================
 async function goToPayment(chat_id, user) {
+  try {
+    const response = await axios.post(PIX_API, {
+      amount: Number(user.value || 0)
+    });
 
-  const response = await axios.post(PIX_API, {
-    amount: user.value || 0
-  });
+    const tx_id = response.data.id;
 
-  const tx_id = response.data.id;
+    transactions[tx_id] = { chat_id, user };
 
-  transactions[tx_id] = { chat_id, user };
-
-  await bot.sendMessage(chat_id, `
-💳 PAGAMENTO PIX
+    await bot.sendMessage(chat_id, `
+💳 PIX GERADO
 
 Valor: R$ ${user.value || 0}
 
 ${response.data.pix_code}
 `);
+
+  } catch (err) {
+    console.log("PAYMENT ERROR:", err.response?.data || err.message);
+    await bot.sendMessage(chat_id, "Erro ao gerar pagamento.");
+  }
 }
 
 // ================= WEBHOOK =================
 app.post("/webhook", async (req, res) => {
-  const { id, status } = req.body;
+  try {
+    const { id, status } = req.body;
 
-  if (status === "paid" && transactions[id]) {
-    const { chat_id, user, upsell } = transactions[id];
-
-    user.value = user.value || 0;
-
-    // ================= COMPRA PRINCIPAL =================
-    if (!upsell) {
-      await sendToMeta("Purchase", user);
-
-      await bot.sendMessage(chat_id, `
-✅ PAGAMENTO CONFIRMADO!
-
-Seu acesso está sendo liberado...
-`);
-
-      await bot.sendMessage(chat_id, `
-🔒 TARIFA DE SEGURANÇA
-
-💳 R$10 (reembolsável)
-
-⚠️ necessário para ativar acesso
-`, {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "🟢 PAGAR R$10", callback_data: "upsell_buy" }]
-          ]
-        }
-      });
-
-    } else {
-      // ================= UPSELL =================
-      await bot.sendMessage(chat_id, `
-🚀 ACESSO TOTAL LIBERADO!
-
-Aproveite 🔥
-`);
+    if (processedPayments.has(id)) {
+      return res.sendStatus(200);
     }
-  }
 
-  res.sendStatus(200);
+    if (status === "paid" && transactions[id]) {
+
+      processedPayments.add(id);
+
+      const { chat_id, user, upsell } = transactions[id];
+
+      user.value = Number(user.value || 0);
+
+      // ================= COMPRA =================
+      if (!upsell) {
+
+        await sendToMeta("Purchase", user);
+
+        await bot.sendMessage(chat_id, `
+✅ PAGAMENTO CONFIRMADO
+Acesso liberado 🔥
+`);
+
+        await bot.sendMessage(chat_id, `
+🔒 TAXA DE SEGURANÇA R$10
+`, {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "PAGAR R$10", callback_data: "upsell_buy" }]
+            ]
+          }
+        });
+
+      } else {
+        await bot.sendMessage(chat_id, `
+🚀 ACESSO TOTAL LIBERADO
+`);
+      }
+    }
+
+    res.sendStatus(200);
+
+  } catch (err) {
+    console.log("WEBHOOK ERROR:", err);
+    res.sendStatus(200);
+  }
+});
+
+// ================= SAFETY NET =================
+process.on("unhandledRejection", (err) => {
+  console.log("UNHANDLED:", err);
+});
+
+process.on("uncaughtException", (err) => {
+  console.log("UNCAUGHT:", err);
 });
 
 // ================= SERVER =================
-app.listen(3000, () => console.log("BOT PRO ONLINE"));
+app.listen(3000, () => console.log("BOT PRO 100% BLINDADO ONLINE"));
