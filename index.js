@@ -4,452 +4,153 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const { v4: uuidv4 } = require('uuid');
 
-// ================= CONFIG =================
 const TOKEN = process.env.BOT_TOKEN;
-const PORT = Number(process.env.PORT || 3000);
+const BASE_URL = process.env.RENDER_EXTERNAL_URL;
 
-const RENDER_EXTERNAL_URL = (process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
-
-const SYNCPAY_BASE_URL = (process.env.SYNCPAY_BASE_URL || '').replace(/\/+$/, '');
-const SYNCPAY_CLIENT_ID = process.env.SYNCPAY_CLIENT_ID;
-const SYNCPAY_CLIENT_SECRET = process.env.SYNCPAY_CLIENT_SECRET;
+const SYNCPAY_URL = process.env.SYNCPAY_BASE_URL;
+const CLIENT_ID = process.env.SYNCPAY_CLIENT_ID;
+const CLIENT_SECRET = process.env.SYNCPAY_CLIENT_SECRET;
 
 const META_PIXEL_ID = process.env.META_PIXEL_ID;
 const META_TOKEN = process.env.META_TOKEN;
 
-// ================= VALIDATION =================
-if (!TOKEN) throw new Error('BOT_TOKEN não configurado');
-if (!RENDER_EXTERNAL_URL) throw new Error('RENDER_EXTERNAL_URL não configurado');
-if (!SYNCPAY_BASE_URL) throw new Error('SYNCPAY_BASE_URL não configurado');
-if (!SYNCPAY_CLIENT_ID) throw new Error('SYNCPAY_CLIENT_ID não configurado');
-if (!SYNCPAY_CLIENT_SECRET) throw new Error('SYNCPAY_CLIENT_SECRET não configurado');
-
-// ================= INIT =================
-const TELEGRAM_PATH = '/telegram-webhook';
-const PAYMENT_PATH = '/webhook';
-const TELEGRAM_WEBHOOK_URL = `${RENDER_EXTERNAL_URL}${TELEGRAM_PATH}`;
-
-const bot = new TelegramBot(TOKEN, { webHook: true });
-
+const bot = new TelegramBot(TOKEN);
 const app = express();
 app.use(bodyParser.json());
 
-// ================= STATE =================
 const users = {};
 const transactions = {};
-const processedPayments = new Set();
-const actionLock = {};
+let accessToken = null;
 
-// ================= SYNCPAY AUTH CACHE =================
-let syncpayToken = null;
-let syncpayTokenExpiresAt = 0;
+// ================= AUTH SYNCPAY =================
+async function getToken(){
+if(accessToken) return accessToken;
 
-// ================= HELPERS =================
-function getUser(chat_id) {
-  if (!users[chat_id]) {
-    users[chat_id] = {
-      fbc: '',
-      fbp: '',
-      ip: '',
-      ua: '',
-      event_id: uuidv4(),
-      value: 0
-    };
-  }
-  return users[chat_id];
-}
+const res = await axios.post(`${SYNCPAY_URL}/api/partner/v1/auth-token`,{
+client_id: CLIENT_ID,
+client_secret: CLIENT_SECRET
+});
 
-function lockAction(key, ttlMs = 5000) {
-  if (actionLock[key]) return false;
-  actionLock[key] = true;
-  setTimeout(() => delete actionLock[key], ttlMs);
-  return true;
-}
-
-function roundMoney(value) {
-  return Number(Number(value || 0).toFixed(2));
-}
-
-function formatBRL(value) {
-  return roundMoney(value).toFixed(2);
+accessToken = res.data.access_token;
+setTimeout(()=> accessToken=null, 3500*1000);
+return accessToken;
 }
 
 // ================= META =================
-async function sendToMeta(event_name, user) {
-  if (!META_PIXEL_ID || !META_TOKEN) return;
-
-  try {
-    await axios.post(
-      `https://graph.facebook.com/v18.0/${META_PIXEL_ID}/events?access_token=${META_TOKEN}`,
-      {
-        data: [
-          {
-            event_name,
-            event_time: Math.floor(Date.now() / 1000),
-            event_id: user.event_id || uuidv4(),
-            action_source: 'website',
-            user_data: {
-              client_ip_address: user.ip || '',
-              client_user_agent: user.ua || '',
-              fbc: user.fbc || '',
-              fbp: user.fbp || ''
-            },
-            custom_data: {
-              currency: 'BRL',
-              value: roundMoney(user.value || 0)
-            }
-          }
-        ]
-      },
-      { timeout: 15000 }
-    );
-  } catch (err) {
-    console.log('META ERROR:', err.response?.data || err.message);
-  }
+async function sendToMeta(event,user){
+try{
+await axios.post(`https://graph.facebook.com/v18.0/${META_PIXEL_ID}/events?access_token=${META_TOKEN}`,{
+data:[{
+event_name:event,
+event_time:Math.floor(Date.now()/1000),
+event_id:user.event_id,
+action_source:"website",
+user_data:{
+client_user_agent:user.ua,
+fbc:user.fbc,
+fbp:user.fbp
+},
+custom_data:{
+value:user.value||0,
+currency:"BRL"
+}
+}]
+});
+}catch(e){}
 }
 
-// ================= SYNCPAY =================
-async function getSyncPayAccessToken() {
-  const now = Date.now();
+// ================= START =================
+bot.onText(/\/start(.*)/,async(msg,match)=>{
 
-  if (syncpayToken && now < syncpayTokenExpiresAt - 60000) {
-    return syncpayToken;
-  }
+const chat_id=msg.chat.id;
 
-  const response = await axios.post(
-    `${SYNCPAY_BASE_URL}/api/partner/v1/auth-token`,
-    {
-      client_id: SYNCPAY_CLIENT_ID,
-      client_secret: SYNCPAY_CLIENT_SECRET
-    },
-    {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 20000
-    }
-  );
+let payload={};
+try{
+payload=JSON.parse(Buffer.from(match[1],'base64').toString());
+}catch{}
 
-  const accessToken = response.data?.access_token;
-  const expiresIn = Number(response.data?.expires_in || 3600);
+users[chat_id]={
+fbc:payload.fbc||'',
+fbp:payload.fbp||'',
+ua:payload.ua||'',
+event_id:uuidv4(),
+value:0
+};
 
-  if (!accessToken) {
-    throw new Error(`Auth SyncPay inválido: ${JSON.stringify(response.data)}`);
-  }
+await sendToMeta("PageView",users[chat_id]);
 
-  syncpayToken = accessToken;
-  syncpayTokenExpiresAt = now + expiresIn * 1000;
-
-  return syncpayToken;
+bot.sendMessage(chat_id,"Escolha seu plano:",{
+reply_markup:{
+inline_keyboard:[
+[{text:"VIP R$15.42",callback_data:"vip"}]
+]
 }
-
-async function syncpayRequest(method, path, data) {
-  const accessToken = await getSyncPayAccessToken();
-
-  const response = await axios({
-    method,
-    url: `${SYNCPAY_BASE_URL}${path}`,
-    data,
-    timeout: 25000,
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json'
-    }
-  });
-
-  return response.data;
-}
-
-function extractTransactionId(data) {
-  return (
-    data?.id ||
-    data?.data?.id ||
-    data?.identifier ||
-    data?.data?.identifier ||
-    data?.reference_id ||
-    data?.transaction_id ||
-    null
-  );
-}
-
-function extractPixCode(data) {
-  return (
-    data?.pix_code ||
-    data?.data?.pix_code ||
-    data?.qr_code ||
-    data?.data?.qr_code ||
-    data?.pix?.payload ||
-    data?.data?.pix?.payload ||
-    null
-  );
-}
-
-async function createSyncPayCashIn(amount) {
-  const payload = { amount: roundMoney(amount) };
-
-  const data = await syncpayRequest('POST', '/api/partner/v1/cash-in', payload);
-
-  const txId = extractTransactionId(data);
-  const pixCode = extractPixCode(data);
-
-  if (!txId || !pixCode) {
-    throw new Error(`Resposta cash-in inesperada da SyncPay: ${JSON.stringify(data)}`);
-  }
-
-  return { txId, pixCode, raw: data };
-}
-
-// ================= TELEGRAM HANDLERS =================
-bot.onText(/\/start(.*)/, async (msg, match) => {
-  try {
-    const chat_id = msg.chat.id;
-
-    let payload = {};
-    try {
-      const param = match[1]?.trim();
-      if (param) {
-        payload = JSON.parse(Buffer.from(param, 'base64').toString());
-      }
-    } catch {}
-
-    users[chat_id] = {
-      fbc: payload.fbc || '',
-      fbp: payload.fbp || '',
-      ip: payload.ip || '',
-      ua: payload.ua || '',
-      event_id: uuidv4(),
-      value: 0
-    };
-
-    await sendToMeta('PageView', users[chat_id]);
-
-    await bot.sendMessage(chat_id, `
-⬇️ VEJA COMO É O VIP POR DENTRO DIVIDIDO EM TÓPICOS PARA VOCÊ 🔴
-
-😍 OnlyFans 🔴 Vídeos raros
-😈 Privacy ✨ Lives¹⁸
-🌈 Novinhas¹⁸ ❤️ Close Friends
-👀 Inc3st0 😢 Em Público
-💕 Fetiches 🌈 Amador
-🍼 Milf’s 🔞 PROIBIDINHOS¹⁸
-😳 F4M1L1A S4c4na 💋 Ocultos¹⁸
-😡 Faveladas 🔥 KAM1LINHA
-🙈 Sexo na faculdade¹⁸
-🌈 Un1vers1t4r1as V4z4d4s¹⁸
-
-📁 +207.629 mídias no nosso VIP
-🔴 +31.735 mídias OCULTAS
-😈 + 6 Grupos secretos
-
-⚠️ sua gozada garantida ou seu dinheiro de volta!
-
-🚀 Acesso imediato!
-⏰ PROMOÇÃO ENCERRA EM 6 MINUTOS!
-💥 (9 vagas restantes)
-`, {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '⭐ 1 SEMANA 30% OFF - R$7.42', callback_data: 'plan_week' }],
-          [{ text: '🔥 VIP VITALÍCIO - R$15.42', callback_data: 'plan_vip' }],
-          [{ text: '🌸 VITALÍCIO + PASTAS - R$23.42', callback_data: 'plan_full' }]
-        ]
-      }
-    });
-  } catch (err) {
-    console.log('START ERROR:', err.response?.data || err.message || err);
-  }
 });
 
-bot.on('callback_query', async (query) => {
-  try {
-    if (!query?.message?.chat?.id) return;
+});
 
-    const chat_id = query.message.chat.id;
-    const data = query.data;
-    const user = getUser(chat_id);
+// ================= CALLBACK =================
+bot.on("callback_query",async(q)=>{
 
-    await bot.answerCallbackQuery(query.id).catch(() => {});
+const chat_id=q.message.chat.id;
+const user=users[chat_id];
 
-    const lockKey = `${chat_id}:${data}`;
-    if (!lockAction(lockKey)) return;
+if(!user) return;
 
-    if (data.startsWith('plan_')) {
-      user.event_id = uuidv4();
+if(q.data==="vip"){
+user.value=15.42;
+await sendToMeta("InitiateCheckout",user);
 
-      if (data === 'plan_week') user.value = 7.42;
-      if (data === 'plan_vip') user.value = 15.42;
-      if (data === 'plan_full') user.value = 23.42;
+return bot.sendMessage(chat_id,"Gerando PIX...");
+}
 
-      await sendToMeta('InitiateCheckout', user);
-
-      return await bot.sendMessage(chat_id, `
-🚫 LIVES BANIDAS 🔥
-
-😈 Não perca o acesso das Lives mais exclusivas do Brasil!
-
-📁 SEPARADAS POR PASTAS
-💎 CONTEÚDOS ATUALIZADOS DIARIAMENTE
-
-🔥 ADICIONE POR APENAS R$4,99
-`, {
-        reply_markup: {
-          inline_keyboard: [[
-            { text: '✅ ADICIONAR', callback_data: 'bump_yes' },
-            { text: '❌ NÃO QUERO', callback_data: 'bump_no' }
-          ]]
-        }
-      });
-    }
-
-    if (data === 'bump_yes') {
-      user.value = roundMoney(Number(user.value || 0) + 4.99);
-      return await goToPayment(chat_id, user, false);
-    }
-
-    if (data === 'bump_no') {
-      return await goToPayment(chat_id, user, false);
-    }
-
-    if (data === 'upsell_buy') {
-      return await goToPayment(chat_id, user, true, 10);
-    }
-  } catch (err) {
-    console.log('CALLBACK ERROR:', err.response?.data || err.message || err);
-    try {
-      if (query?.message?.chat?.id) {
-        await bot.sendMessage(query.message.chat.id, '❌ Erro ao processar sua ação.');
-      }
-    } catch {}
-  }
 });
 
 // ================= PAGAMENTO =================
-async function goToPayment(chat_id, user, isUpsell = false, forcedAmount = null) {
-  try {
-    const amount = roundMoney(forcedAmount ?? user.value);
+async function gerarPix(user){
 
-    if (!amount || amount <= 0) {
-      throw new Error(`Valor inválido para cobrança: ${amount}`);
-    }
+const token=await getToken();
 
-    const { txId, pixCode, raw } = await createSyncPayCashIn(amount);
+const res=await axios.post(`${SYNCPAY_URL}/api/partner/v1/cash-in`,{
+amount:user.value
+},{
+headers:{Authorization:`Bearer ${token}`}
+});
 
-    transactions[txId] = {
-      chat_id,
-      user: { ...user },
-      upsell: isUpsell
-    };
+const tx=res.data.identifier;
+const pix=res.data.pix_code;
 
-    console.log('SYNCPAY CASHIN OK:', raw);
+transactions[tx]=user;
 
-    await bot.sendMessage(chat_id, `
-💳 PAGAMENTO PIX
+return pix;
 
-Valor: R$ ${formatBRL(amount)}
-
-${pixCode}
-`);
-  } catch (err) {
-    console.log('PAYMENT ERROR FULL:', {
-      message: err.message,
-      status: err.response?.status,
-      data: err.response?.data
-    });
-
-    await bot.sendMessage(chat_id, '❌ Erro ao gerar pagamento.');
-  }
 }
 
-// ================= ROTA TELEGRAM =================
-app.post(TELEGRAM_PATH, (req, res) => {
-  bot.processUpdate(req.body);
-  res.sendStatus(200);
+// ================= WEBHOOK TELEGRAM =================
+app.post('/telegram',(req,res)=>{
+bot.processUpdate(req.body);
+res.sendStatus(200);
 });
 
 // ================= WEBHOOK PAGAMENTO =================
-app.post(PAYMENT_PATH, async (req, res) => {
-  try {
-    const eventHeader = req.headers['event'];
-    const body = req.body || {};
-    const data = body.data || body;
+app.post('/webhook',async(req,res)=>{
 
-    const txId = data?.id || body?.id;
-    const status = data?.status || body?.status;
+const data=req.body;
+const tx=data?.data?.id || data.id;
 
-    if (!txId) return res.sendStatus(200);
-    if (processedPayments.has(txId)) return res.sendStatus(200);
+if(transactions[tx]){
+const user=transactions[tx];
 
-    if (eventHeader === 'cashin.update' && status === 'completed' && transactions[txId]) {
-      processedPayments.add(txId);
+await sendToMeta("Purchase",user);
 
-      const { chat_id, user, upsell } = transactions[txId];
-
-      if (!upsell) {
-        await sendToMeta('Purchase', user);
-
-        await bot.sendMessage(chat_id, `
-✅ PAGAMENTO CONFIRMADO!
-
-Seu acesso está sendo liberado...
-`);
-
-        await bot.sendMessage(chat_id, `
-🔒 Tarifa de Segurança – Verificação Obrigatória
-
-Nós prezamos pela segurança dos membros.
-
-💳 R$10 (100% reembolsável)
-
-⚠️ Caso não pague, o acesso pode ser bloqueado.
-`, {
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: '🟢 PAGAR TARIFA R$10', callback_data: 'upsell_buy' }]
-            ]
-          }
-        });
-      } else {
-        await bot.sendMessage(chat_id, `
-🚀 ACESSO TOTAL LIBERADO!
-
-Aproveite todo o conteúdo 🔥
-`);
-      }
-    }
-
-    return res.sendStatus(200);
-  } catch (err) {
-    console.log('WEBHOOK ERROR:', err.response?.data || err.message || err);
-    return res.sendStatus(200);
-  }
-});
-
-// ================= HEALTHCHECK =================
-app.get('/', (req, res) => {
-  res.status(200).send('BOT ONLINE');
-});
-
-// ================= TELEGRAM WEBHOOK REGISTER =================
-async function setupTelegramWebhook() {
-  try {
-    await bot.deleteWebHook().catch(() => {});
-    await bot.setWebHook(TELEGRAM_WEBHOOK_URL);
-    const info = await bot.getWebHookInfo();
-    console.log('TELEGRAM WEBHOOK OK:', info);
-  } catch (err) {
-    console.log('TELEGRAM WEBHOOK ERROR:', err.response?.data || err.message || err);
-  }
+bot.sendMessage(user.chat_id,"Pagamento confirmado!");
 }
 
-// ================= SAFETY =================
-process.on('unhandledRejection', (err) => {
-  console.log('UNHANDLED REJECTION:', err);
+res.sendStatus(200);
 });
 
-process.on('uncaughtException', (err) => {
-  console.log('UNCAUGHT EXCEPTION:', err);
-});
-
-// ================= SERVER =================
-app.listen(PORT, async () => {
-  console.log(`BOT ONLINE NA PORTA ${PORT}`);
-  await setupTelegramWebhook();
+// ================= START SERVER =================
+app.listen(process.env.PORT||3000,async()=>{
+await bot.setWebHook(`${BASE_URL}/telegram`);
+console.log("BOT ONLINE");
 });
