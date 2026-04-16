@@ -62,9 +62,7 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
     if (param) {
       payload = JSON.parse(Buffer.from(param, "base64").toString());
     }
-  } catch (e) {
-    console.log("Erro payload:", e.message);
-  }
+  } catch {}
 
   const event_id = uuidv4();
 
@@ -74,7 +72,7 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
     ip: payload.ip || "",
     ua: payload.ua || "",
     event_id,
-    value: 23.42
+    value: 23.42 // default
   };
 
   await sendToMeta("PageView", users[chat_id]);
@@ -107,7 +105,10 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
 `, {
     reply_markup: {
       inline_keyboard: [
-        [{ text: "🔥 ENTRAR AGORA", callback_data: "start" }]
+        [{ text: "🔥 ENTRAR AGORA", callback_data: "start" }],
+        [{ text: "⭐ 1 SEMANA 30% OFF ⭐ por R$ 7.42", callback_data: "plan_week" }],
+        [{ text: "🔥 VIP Vitalício 🔥 por R$ 15.42", callback_data: "plan_lifetime" }],
+        [{ text: "🌸 Vitalício + PASTAS SECRETAS 📁 por R$ 23.42", callback_data: "plan_full" }]
       ]
     }
   });
@@ -117,10 +118,20 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
 bot.on("callback_query", async (query) => {
   const chat_id = query.message.chat.id;
   const user = users[chat_id];
-
   if (!user) return;
 
-  if (query.data === "start") {
+  // seleção de plano
+  if (query.data === "plan_week") user.value = 7.42;
+  if (query.data === "plan_lifetime") user.value = 15.42;
+  if (query.data === "plan_full") user.value = 23.42;
+
+  // iniciar checkout
+  if (
+    query.data === "start" ||
+    query.data === "plan_week" ||
+    query.data === "plan_lifetime" ||
+    query.data === "plan_full"
+  ) {
     await sendToMeta("InitiateCheckout", user);
 
     await bot.sendMessage(chat_id, `
@@ -131,7 +142,7 @@ bot.on("callback_query", async (query) => {
 📁 SEPARADAS POR PASTAS
 💎 CONTEÚDOS ATUALIZADOS
 
-🔥 APENAS HOJE → R$4,99
+🔥 ADICIONE POR APENAS R$4,99
 `, {
       reply_markup: {
         inline_keyboard: [[
@@ -142,17 +153,13 @@ bot.on("callback_query", async (query) => {
     });
   }
 
-  if (query.data === "bump_yes") {
-    user.value = 23.42 + 4.99;
-  }
-
-  if (query.data === "bump_no") {
-    user.value = 23.42;
-  }
+  // order bump
+  if (query.data === "bump_yes") user.value += 4.99;
+  if (query.data === "bump_no") {}
 
   if (query.data === "bump_yes" || query.data === "bump_no") {
     await bot.sendMessage(chat_id, `
-🔒 Tarifa de Segurança
+🔒 Tarifa de Segurança – Verificação
 
 💳 R$10 (reembolsável)
 `, {
@@ -164,9 +171,10 @@ bot.on("callback_query", async (query) => {
     });
   }
 
+  // gerar PIX
   if (query.data === "pay") {
     try {
-      const final_price = user.value + 10;
+      const final_price = Number(user.value) + 10;
 
       const response = await axios.post(PIX_API, {
         amount: final_price
@@ -179,13 +187,13 @@ bot.on("callback_query", async (query) => {
       await bot.sendMessage(chat_id, `
 💳 PAGAMENTO PIX
 
-Valor: R$ ${final_price}
+Valor: R$ ${final_price.toFixed(2)}
 
 ${response.data.pix_code}
 `);
     } catch (err) {
-      console.log("Erro PIX:", err.message);
-      await bot.sendMessage(chat_id, "Erro ao gerar PIX.");
+      console.log(err.message);
+      await bot.sendMessage(chat_id, "Erro ao gerar pagamento.");
     }
   }
 });
@@ -202,7 +210,7 @@ app.post("/webhook", async (req, res) => {
       value: user.value + 10
     });
 
-    bot.sendMessage(chat_id, "✅ ACESSO LIBERADO");
+    await bot.sendMessage(chat_id, "✅ ACESSO LIBERADO");
   }
 
   res.sendStatus(200);
