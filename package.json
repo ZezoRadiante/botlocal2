@@ -8,6 +8,7 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.43.4",
     "axios": "^1.6.8",
+    "cors": "^2.8.5",
     "body-parser": "^1.20.2",
     "express": "^4.19.2",
     "node-telegram-bot-api": "^0.64.0",
