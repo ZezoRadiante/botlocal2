@@ -2,6 +2,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const express = require('express');
 const bodyParser = require('body-parser');
+const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
@@ -71,6 +72,12 @@ const TELEGRAM_WEBHOOK_URL = `${BASE_URL}${TELEGRAM_PATH}`;
 
 const bot = new TelegramBot(TOKEN, { webHook: true });
 const app = express();
+
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type']
+}));
 app.use(bodyParser.json());
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -804,6 +811,7 @@ app.post('/prepare-start', async (req, res) => {
   try {
     const payload = req.body || {};
     const token = await createStartPayload(payload);
+    console.log('TOKEN GERADO:', token);
     return res.status(200).json({ token });
   } catch (err) {
     console.log('PREPARE START ERROR:', err.response?.data || err.message || err);
