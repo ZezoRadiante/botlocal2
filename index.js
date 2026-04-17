@@ -13,7 +13,6 @@ const SYNCPAY_URL = (process.env.SYNCPAY_BASE_URL || '').replace(/\/+$/, '');
 const CLIENT_ID = process.env.SYNCPAY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SYNCPAY_CLIENT_SECRET;
 
-// Novo pixel já implementado
 const META_PIXEL_ID = '1505014021315132';
 const META_TOKEN = process.env.META_TOKEN;
 
@@ -99,6 +98,13 @@ function safeBase64JsonDecode(encoded) {
   } catch {
     return {};
   }
+}
+
+function escapeHtml(text) {
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 function getUser(chat_id) {
@@ -542,6 +548,65 @@ Ainda dá tempo de garantir uma condição diferente antes de sair.
   });
 }
 
+// ================= CHECKOUT UI =================
+async function sendPixCheckoutMessage(chat_id, txId, amount, pixCode) {
+  const introMessage = [
+    '✅ <b>Como realizar o pagamento:</b>',
+    '1. Abra o aplicativo do seu banco.',
+    '2. Selecione a opção "Pagar" ou "PIX".',
+    '3. Escolha "PIX Copia e Cola".',
+    '4. Cole a chave que está abaixo e finalize o pagamento com segurança.',
+    '',
+    'Amor, falta pouco! 😈',
+    'Gere o PIX abaixo para liberar seu acesso imediatamente.',
+    '',
+    '<b>NÃO ESQUEÇA DE APERTAR EM CONFERIR PAGAMENTO APÓS FINALIZAR!!</b>',
+    '',
+    '👇 Toque no código para copiar e pague no seu app de banco.',
+    'Assim que confirmar, eu te chamo aqui na hora!'
+  ].join('\n');
+
+  await bot.sendMessage(chat_id, introMessage, {
+    parse_mode: 'HTML'
+  });
+
+  await bot.sendMessage(chat_id, 'Copie o código abaixo:');
+
+  await bot.sendMessage(chat_id, `<code>${escapeHtml(pixCode)}</code>`, {
+    parse_mode: 'HTML'
+  });
+
+  await bot.sendMessage(chat_id, 'Estou segurando sua vaga por 5 minutos... ⏳');
+
+  const keyboard = [
+    [{ text: '✅ Verificar Status', callback_data: `check_payment:${txId}` }]
+  ];
+
+  if (pixCode && pixCode.length <= 256) {
+    keyboard.push([
+      {
+        text: '📋 Copiar Código',
+        copy_text: {
+          text: pixCode
+        }
+      }
+    ]);
+  } else {
+    keyboard.push([
+      {
+        text: '📋 Copiar Código',
+        callback_data: `copy_fallback:${txId}`
+      }
+    ]);
+  }
+
+  await bot.sendMessage(chat_id, 'Escolha uma opção abaixo:', {
+    reply_markup: {
+      inline_keyboard: keyboard
+    }
+  });
+}
+
 // ================= PAYMENT =================
 async function goToPayment(chat_id, user, options = {}) {
   const {
@@ -570,13 +635,7 @@ async function goToPayment(chat_id, user, options = {}) {
 
     console.log('SYNCPAY CASHIN OK:', raw);
 
-    await bot.sendMessage(chat_id, `
-💳 PAGAMENTO PIX
-
-Valor: R$ ${formatBRL(amount)}
-
-${pixCode}
-`);
+    await sendPixCheckoutMessage(chat_id, txId, amount, pixCode);
   } catch (err) {
     console.log('PAYMENT ERROR FULL:', {
       message: err.message,
@@ -691,6 +750,35 @@ bot.on('callback_query', async (query) => {
       user.stopRemarketing = true;
       cancelAllScheduledBumps(chat_id);
       return await bot.sendMessage(chat_id, 'Tudo bem.');
+    }
+
+    if (data === 'check_payment' || data.startsWith('check_payment:')) {
+      const txId = data.includes(':') ? data.split(':')[1] : null;
+      const tx = txId ? transactions[txId] : null;
+
+      if (!tx) {
+        return await bot.sendMessage(chat_id, '❌ Não encontrei esse pagamento. Gere um novo PIX.');
+      }
+
+      if (tx.status === 'paid') {
+        return await bot.sendMessage(chat_id, '✅ Seu pagamento já foi confirmado.');
+      }
+
+      return await bot.sendMessage(chat_id, '⏳ Ainda não localizei a confirmação. Se você acabou de pagar, aguarde alguns segundos e toque novamente em verificar status.');
+    }
+
+    if (data === 'copy_fallback' || data.startsWith('copy_fallback:')) {
+      const txId = data.includes(':') ? data.split(':')[1] : null;
+      const tx = txId ? transactions[txId] : null;
+
+      if (!tx) {
+        return await bot.sendMessage(chat_id, '❌ Não encontrei esse código. Gere um novo PIX.');
+      }
+
+      return await bot.sendMessage(
+        chat_id,
+        '⚠️ O Telegram não permitiu o botão de cópia automática para esse código. Toque e segure no bloco do PIX para copiar manualmente.'
+      );
     }
 
     if (data === 'downsell_view') {
