@@ -3,6 +3,8 @@ const axios = require('axios');
 const express = require('express');
 const bodyParser = require('body-parser');
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
 
 // ================= CONFIG =================
 const TOKEN = process.env.BOT_TOKEN;
@@ -15,12 +17,16 @@ const CLIENT_SECRET = process.env.SYNCPAY_CLIENT_SECRET;
 
 const META_PIXEL_ID = '1505014021315132';
 const META_TOKEN = process.env.META_TOKEN;
+const META_TEST_EVENT_CODE = process.env.META_TEST_EVENT_CODE || '';
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 // ================= MEDIA =================
 const VIDEO_START = 'BAACAgEAAxkBAANjaeE1lWS7RCCUF3G0cehARZeHIxoAArkGAAIqEglHTEGxhQwHcS87BA';
 const VIDEO_BUMP = 'BAACAgEAAxkBAANlaeE1r7jftHF1Z1ZkDpTLWFFY1_cAAroGAAIqEglHsnlZ68ElDLU7BA';
 
-// Futuras mídias do downsell
+// Estrutura pronta para futuro downsell
 const DOWNSELL_MEDIA = {
   enabled: false,
   type: 'video', // 'video' | 'photo' | 'document'
@@ -37,7 +43,7 @@ const ORDER_BUMP_SCHEDULES = [
   { key: 'bump_1', delayMs: 10 * 60 * 1000 },
   { key: 'bump_2', delayMs: 20 * 60 * 1000 },
   { key: 'bump_3', delayMs: 45 * 60 * 1000 },
-  { key: 'bump_4', delayMs: 60 * 60 * 1000 },
+  { key: 'bump_4', delayMs: 1 * 60 * 60 * 1000 },
   { key: 'bump_5', delayMs: 2 * 60 * 60 * 1000 },
   { key: 'bump_6', delayMs: 4 * 60 * 60 * 1000 },
   { key: 'bump_7', delayMs: 6 * 60 * 60 * 1000 },
@@ -55,6 +61,8 @@ if (!SYNCPAY_URL) throw new Error('SYNCPAY_BASE_URL não configurado');
 if (!CLIENT_ID) throw new Error('SYNCPAY_CLIENT_ID não configurado');
 if (!CLIENT_SECRET) throw new Error('SYNCPAY_CLIENT_SECRET não configurado');
 if (!META_TOKEN) throw new Error('META_TOKEN não configurado');
+if (!SUPABASE_URL) throw new Error('SUPABASE_URL não configurado');
+if (!SUPABASE_SERVICE_ROLE_KEY) throw new Error('SUPABASE_SERVICE_ROLE_KEY não configurado');
 
 // ================= INIT =================
 const TELEGRAM_PATH = '/telegram';
@@ -65,13 +73,13 @@ const bot = new TelegramBot(TOKEN, { webHook: true });
 const app = express();
 app.use(bodyParser.json());
 
-// ================= MEMORY STATE =================
-const users = {};
-const transactions = {};
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+// ================= MEMORY STATE LEVE =================
+// Aqui fica só deduplicação e cache de token; o estado principal está no Supabase.
 const processedPayments = new Set();
 const actionLock = {};
 const processedMetaEvents = new Set();
-const scheduledBumpTimeouts = {};
 
 let accessToken = null;
 let accessTokenExpiresAt = 0;
@@ -107,78 +115,6 @@ function escapeHtml(text) {
     .replace(/>/g, '&gt;');
 }
 
-function getUser(chat_id) {
-  if (!users[chat_id]) {
-    users[chat_id] = {
-      chat_id,
-      fbc: '',
-      fbp: '',
-      ip: '',
-      ua: '',
-      lang: '',
-      screen: '',
-      tz: '',
-      referrer: '',
-      host: '',
-      path: '',
-      utm_source: '',
-      utm_medium: '',
-      utm_campaign: '',
-      utm_content: '',
-      utm_term: '',
-      utm_ad: '',
-      campaign_id: '',
-      adset_id: '',
-      ad_id: '',
-      redirect_event_id: '',
-      event_id: uuidv4(),
-      value: 0,
-      plan: '',
-      hasPaidMain: false,
-      hasPaidUpsell: false,
-      stopRemarketing: false,
-      bumpHistory: {},
-      createdAt: Date.now(),
-      updatedAt: Date.now()
-    };
-  }
-
-  users[chat_id].updatedAt = Date.now();
-  return users[chat_id];
-}
-
-function mergeUser(chat_id, payload = {}) {
-  const user = getUser(chat_id);
-
-  users[chat_id] = {
-    ...user,
-    chat_id,
-    fbc: payload.fbc || user.fbc || '',
-    fbp: payload.fbp || user.fbp || '',
-    ip: payload.ip || user.ip || '',
-    ua: payload.ua || user.ua || '',
-    lang: payload.lang || user.lang || '',
-    screen: payload.screen || user.screen || '',
-    tz: payload.tz || user.tz || '',
-    referrer: payload.referrer || user.referrer || '',
-    host: payload.host || user.host || '',
-    path: payload.path || user.path || '',
-    utm_source: payload.utm_source || user.utm_source || '',
-    utm_medium: payload.utm_medium || user.utm_medium || '',
-    utm_campaign: payload.utm_campaign || user.utm_campaign || '',
-    utm_content: payload.utm_content || user.utm_content || '',
-    utm_term: payload.utm_term || user.utm_term || '',
-    utm_ad: payload.utm_ad || user.utm_ad || '',
-    campaign_id: payload.campaign_id || user.campaign_id || '',
-    adset_id: payload.adset_id || user.adset_id || '',
-    ad_id: payload.ad_id || user.ad_id || '',
-    redirect_event_id: payload.redirect_event_id || user.redirect_event_id || '',
-    updatedAt: Date.now()
-  };
-
-  return users[chat_id];
-}
-
 function lockAction(key, ttlMs = 5000) {
   if (actionLock[key]) return false;
   actionLock[key] = true;
@@ -210,104 +146,172 @@ function extractPixCode(data) {
   );
 }
 
-function createTransactionRecord({ txId, chat_id, user, amount, upsell = false, downsell = false }) {
-  transactions[txId] = {
-    txId,
-    chat_id,
-    user: { ...user },
-    amount: roundMoney(amount),
-    upsell,
-    downsell,
-    status: 'pending',
-    createdAt: Date.now(),
-    updatedAt: Date.now()
+function sha256(value) {
+  return crypto
+    .createHash('sha256')
+    .update(String(value).trim().toLowerCase())
+    .digest('hex');
+}
+
+// ================= SUPABASE HELPERS =================
+async function upsertUser(user) {
+  const payload = {
+    chat_id: user.chat_id,
+    fbc: user.fbc || '',
+    fbp: user.fbp || '',
+    ip: user.ip || '',
+    ua: user.ua || '',
+    lang: user.lang || '',
+    screen: user.screen || '',
+    tz: user.tz || '',
+    referrer: user.referrer || '',
+    host: user.host || '',
+    path: user.path || '',
+    utm_source: user.utm_source || '',
+    utm_medium: user.utm_medium || '',
+    utm_campaign: user.utm_campaign || '',
+    utm_content: user.utm_content || '',
+    utm_term: user.utm_term || '',
+    utm_ad: user.utm_ad || '',
+    campaign_id: user.campaign_id || '',
+    adset_id: user.adset_id || '',
+    ad_id: user.ad_id || '',
+    redirect_event_id: user.redirect_event_id || '',
+    plan: user.plan || '',
+    value: Number(user.value || 0),
+    has_paid_main: !!user.has_paid_main,
+    has_paid_upsell: !!user.has_paid_upsell,
+    stop_remarketing: !!user.stop_remarketing,
+    updated_at: new Date().toISOString()
   };
+
+  const { error } = await supabase
+    .from('users')
+    .upsert(payload, { onConflict: 'chat_id' });
+
+  if (error) throw error;
 }
 
-function markTransactionPaid(txId) {
-  if (!transactions[txId]) return;
-  transactions[txId].status = 'paid';
-  transactions[txId].updatedAt = Date.now();
-  transactions[txId].paidAt = Date.now();
+async function getUserByChatId(chat_id) {
+  const { data, error } = await supabase
+    .from('users')
+    .select('*')
+    .eq('chat_id', chat_id)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
 }
 
-function cancelAllScheduledBumps(chat_id) {
-  const timers = scheduledBumpTimeouts[chat_id];
-  if (!timers) return;
+async function updateUserByChatId(chat_id, updates) {
+  const { error } = await supabase
+    .from('users')
+    .update({
+      ...updates,
+      updated_at: new Date().toISOString()
+    })
+    .eq('chat_id', chat_id);
 
-  for (const timeoutId of Object.values(timers)) {
-    clearTimeout(timeoutId);
-  }
-
-  delete scheduledBumpTimeouts[chat_id];
+  if (error) throw error;
 }
 
-function canSendScheduledBump(chat_id, bumpKey) {
-  const user = users[chat_id];
-  if (!user) return false;
-  if (user.hasPaidMain) return false;
-  if (user.hasPaidUpsell) return false;
-  if (user.stopRemarketing) return false;
-  if (user.bumpHistory?.[bumpKey]) return false;
-  return true;
+async function createOrUpdateTransaction(tx) {
+  const payload = {
+    tx_id: tx.txId,
+    chat_id: tx.chat_id,
+    amount: Number(tx.amount),
+    status: tx.status || 'pending',
+    upsell: !!tx.upsell,
+    downsell: !!tx.downsell,
+    pix_code: tx.pixCode || '',
+    plan: tx.plan || '',
+    meta_purchase_sent: !!tx.meta_purchase_sent,
+    updated_at: new Date().toISOString()
+  };
+
+  const { error } = await supabase
+    .from('transactions')
+    .upsert(payload, { onConflict: 'tx_id' });
+
+  if (error) throw error;
 }
 
-function getScheduledBumpCopy(index) {
-  const copies = [
-    `🔥 Você entrou e ainda não garantiu seu acesso.\n\nAs vagas promocionais estão acabando e o VIP pode sair do ar a qualquer momento.`,
-    `⚠️ Seu acesso ainda está pendente.\n\nSe quiser entrar com desconto, essa é a melhor hora para finalizar.`,
-    `🚨 Muita gente entra, olha e volta depois.\n\nQuando volta, a promoção já acabou.`,
-    `⏳ Seu benefício ainda está disponível.\n\nMas não dá para garantir por muito tempo.`,
-    `🔥 O conteúdo continua te esperando.\n\nSe quiser aproveitar o valor atual, finalize agora.`,
-    `😈 As melhores pastas e mídias continuam bloqueadas.\n\nSó falta liberar seu acesso.`,
-    `⚠️ Estamos nas últimas vagas promocionais.\n\nDepois disso, o valor pode subir.`,
-    `💥 Últimas horas com essa condição.\n\nSe você quer entrar, esse é o melhor momento.`,
-    `🔥 Seu acesso ainda não foi ativado.\n\nNão deixa para depois e perde a oferta.`,
-    `🚨 Oferta quase encerrada.\n\nAinda dá tempo de entrar pagando menos.`,
-    `⏰ O desconto segue ativo por pouco tempo.\n\nFinalize enquanto ainda está liberado.`,
-    `⚠️ Último aviso.\n\nDepois dessa mensagem, não dá para garantir que o valor continue o mesmo.`
-  ];
+async function getTransactionByTxId(txId) {
+  const { data, error } = await supabase
+    .from('transactions')
+    .select('*')
+    .eq('tx_id', txId)
+    .maybeSingle();
 
-  return copies[index] || `⚠️ Sua oferta ainda está disponível por pouco tempo.`;
+  if (error) throw error;
+  return data;
 }
 
-async function scheduleOrderBumps(chat_id) {
-  const user = getUser(chat_id);
+async function markTransactionPaidDb(txId) {
+  const { error } = await supabase
+    .from('transactions')
+    .update({
+      status: 'paid',
+      paid_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    })
+    .eq('tx_id', txId);
 
-  cancelAllScheduledBumps(chat_id);
-  scheduledBumpTimeouts[chat_id] = {};
+  if (error) throw error;
+}
 
-  ORDER_BUMP_SCHEDULES.forEach((item, index) => {
-    const timeoutId = setTimeout(async () => {
-      try {
-        if (!canSendScheduledBump(chat_id, item.key)) return;
+async function scheduleUserBumpsInDb(chat_id) {
+  const now = Date.now();
 
-        const currentUser = getUser(chat_id);
-        currentUser.bumpHistory[item.key] = Date.now();
+  const rows = ORDER_BUMP_SCHEDULES.map((item) => ({
+    chat_id,
+    bump_key: item.key,
+    run_at: new Date(now + item.delayMs).toISOString(),
+    sent: false
+  }));
 
-        await sendOptionalVideo(chat_id, VIDEO_BUMP, `AUTO BUMP VIDEO ${item.key}`);
+  const { error } = await supabase
+    .from('scheduled_bumps')
+    .upsert(rows, { onConflict: 'chat_id,bump_key' });
 
-        await bot.sendMessage(chat_id, `
-${getScheduledBumpCopy(index)}
+  if (error) throw error;
+}
 
-💳 Toque abaixo para gerar seu pagamento agora.
-`, {
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: '🔥 GERAR PIX AGORA', callback_data: 'remarketing_pay_now' }],
-              [{ text: '❌ NÃO QUERO', callback_data: 'remarketing_no' }]
-            ]
-          }
-        });
-      } catch (err) {
-        console.log(`SCHEDULED BUMP ERROR ${item.key}:`, err.response?.data || err.message || err);
-      }
-    }, item.delayMs);
+async function stopAllUserBumps(chat_id) {
+  const { error } = await supabase
+    .from('scheduled_bumps')
+    .update({
+      sent: true,
+      sent_at: new Date().toISOString()
+    })
+    .eq('chat_id', chat_id)
+    .eq('sent', false);
 
-    scheduledBumpTimeouts[chat_id][item.key] = timeoutId;
-  });
+  if (error) throw error;
+}
 
-  user.updatedAt = Date.now();
+async function getDueBumps(limit = 50) {
+  const { data, error } = await supabase
+    .from('scheduled_bumps')
+    .select('*')
+    .eq('sent', false)
+    .lte('run_at', new Date().toISOString())
+    .limit(limit);
+
+  if (error) throw error;
+  return data || [];
+}
+
+async function markBumpSent(id) {
+  const { error } = await supabase
+    .from('scheduled_bumps')
+    .update({
+      sent: true,
+      sent_at: new Date().toISOString()
+    })
+    .eq('id', id);
+
+  if (error) throw error;
 }
 
 // ================= META =================
@@ -319,36 +323,43 @@ async function sendToMeta(event_name, user, overrideEventId = null) {
   processedMetaEvents.add(dedupeKey);
 
   try {
+    const payload = {
+      data: [
+        {
+          event_name,
+          event_time: nowSec(),
+          event_id: metaEventId,
+          action_source: 'website',
+          user_data: {
+            client_ip_address: user.ip || '',
+            client_user_agent: user.ua || '',
+            fbc: user.fbc || '',
+            fbp: user.fbp || '',
+            external_id: user.chat_id ? sha256(user.chat_id) : undefined
+          },
+          custom_data: {
+            currency: 'BRL',
+            value: roundMoney(user.value || 0),
+            utm_source: user.utm_source || '',
+            utm_medium: user.utm_medium || '',
+            utm_campaign: user.utm_campaign || '',
+            utm_content: user.utm_content || '',
+            utm_term: user.utm_term || '',
+            campaign_id: user.campaign_id || '',
+            adset_id: user.adset_id || '',
+            ad_id: user.ad_id || ''
+          }
+        }
+      ]
+    };
+
+    if (META_TEST_EVENT_CODE) {
+      payload.test_event_code = META_TEST_EVENT_CODE;
+    }
+
     await axios.post(
       `https://graph.facebook.com/v18.0/${META_PIXEL_ID}/events?access_token=${META_TOKEN}`,
-      {
-        data: [
-          {
-            event_name,
-            event_time: nowSec(),
-            event_id: metaEventId,
-            action_source: 'website',
-            user_data: {
-              client_ip_address: user.ip || '',
-              client_user_agent: user.ua || '',
-              fbc: user.fbc || '',
-              fbp: user.fbp || ''
-            },
-            custom_data: {
-              currency: 'BRL',
-              value: roundMoney(user.value || 0),
-              utm_source: user.utm_source || '',
-              utm_medium: user.utm_medium || '',
-              utm_campaign: user.utm_campaign || '',
-              utm_content: user.utm_content || '',
-              utm_term: user.utm_term || '',
-              campaign_id: user.campaign_id || '',
-              adset_id: user.adset_id || '',
-              ad_id: user.ad_id || ''
-            }
-          }
-        ]
-      },
+      payload,
       { timeout: 15000 }
     );
   } catch (err) {
@@ -453,7 +464,7 @@ async function sendDownsellMedia(chat_id) {
   }
 }
 
-// ================= FLOW MESSAGES =================
+// ================= COPY EXATA DO FUNIL =================
 async function sendPlanMessage(chat_id) {
   await sendOptionalVideo(chat_id, VIDEO_START, 'START VIDEO');
 
@@ -624,13 +635,15 @@ async function goToPayment(chat_id, user, options = {}) {
 
     const { txId, pixCode, raw } = await createSyncPayCashIn(amount);
 
-    createTransactionRecord({
+    await createOrUpdateTransaction({
       txId,
       chat_id,
-      user,
       amount,
       upsell: isUpsell,
-      downsell: isDownsell
+      downsell: isDownsell,
+      pixCode,
+      plan: user.plan || '',
+      status: 'pending'
     });
 
     console.log('SYNCPAY CASHIN OK:', raw);
@@ -647,6 +660,66 @@ async function goToPayment(chat_id, user, options = {}) {
   }
 }
 
+// ================= BUMP WORKER =================
+async function runScheduledBumps() {
+  try {
+    const bumps = await getDueBumps(50);
+
+    for (const bump of bumps) {
+      try {
+        const user = await getUserByChatId(bump.chat_id);
+
+        if (!user || user.has_paid_main || user.has_paid_upsell || user.stop_remarketing) {
+          await markBumpSent(bump.id);
+          continue;
+        }
+
+        const index = ORDER_BUMP_SCHEDULES.findIndex(x => x.key === bump.bump_key);
+
+        await sendOptionalVideo(bump.chat_id, VIDEO_BUMP, `AUTO BUMP VIDEO ${bump.bump_key}`);
+
+        await bot.sendMessage(bump.chat_id, `
+${getScheduledBumpCopy(index)}
+
+💳 Toque abaixo para gerar seu pagamento agora.
+`, {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔥 GERAR PIX AGORA', callback_data: 'remarketing_pay_now' }],
+              [{ text: '❌ NÃO QUERO', callback_data: 'remarketing_no' }]
+            ]
+          }
+        });
+
+        await markBumpSent(bump.id);
+      } catch (err) {
+        console.log('BUMP SEND ERROR:', err.response?.data || err.message || err);
+      }
+    }
+  } catch (err) {
+    console.log('BUMP WORKER ERROR:', err.response?.data || err.message || err);
+  }
+}
+
+function getScheduledBumpCopy(index) {
+  const copies = [
+    `🔥 Você entrou e ainda não garantiu seu acesso.\n\nAs vagas promocionais estão acabando e o VIP pode sair do ar a qualquer momento.`,
+    `⚠️ Seu acesso ainda está pendente.\n\nSe quiser entrar com desconto, essa é a melhor hora para finalizar.`,
+    `🚨 Muita gente entra, olha e volta depois.\n\nQuando volta, a promoção já acabou.`,
+    `⏳ Seu benefício ainda está disponível.\n\nMas não dá para garantir por muito tempo.`,
+    `🔥 O conteúdo continua te esperando.\n\nSe quiser aproveitar o valor atual, finalize agora.`,
+    `😈 As melhores pastas e mídias continuam bloqueadas.\n\nSó falta liberar seu acesso.`,
+    `⚠️ Estamos nas últimas vagas promocionais.\n\nDepois disso, o valor pode subir.`,
+    `💥 Últimas horas com essa condição.\n\nSe você quer entrar, esse é o melhor momento.`,
+    `🔥 Seu acesso ainda não foi ativado.\n\nNão deixa para depois e perde a oferta.`,
+    `🚨 Oferta quase encerrada.\n\nAinda dá tempo de entrar pagando menos.`,
+    `⏰ O desconto segue ativo por pouco tempo.\n\nFinalize enquanto ainda está liberado.`,
+    `⚠️ Último aviso.\n\nDepois dessa mensagem, não dá para garantir que o valor continue o mesmo.`
+  ];
+
+  return copies[index] || `⚠️ Sua oferta ainda está disponível por pouco tempo.`;
+}
+
 // ================= TELEGRAM START =================
 bot.onText(/\/start(.*)/, async (msg, match) => {
   try {
@@ -654,19 +727,44 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
     const param = match?.[1]?.trim() || '';
     const payload = safeBase64JsonDecode(param);
 
-    const user = mergeUser(chat_id, payload);
-    user.chat_id = chat_id;
-    user.event_id = uuidv4();
-    user.value = 0;
-    user.plan = '';
-    user.hasPaidMain = false;
-    user.hasPaidUpsell = false;
-    user.stopRemarketing = false;
-    user.bumpHistory = {};
+    const user = {
+      chat_id,
+      fbc: payload.fbc || '',
+      fbp: payload.fbp || '',
+      ip: payload.ip || '',
+      ua: payload.ua || '',
+      lang: payload.lang || '',
+      screen: payload.screen || '',
+      tz: payload.tz || '',
+      referrer: payload.referrer || '',
+      host: payload.host || '',
+      path: payload.path || '',
+      utm_source: payload.utm_source || '',
+      utm_medium: payload.utm_medium || '',
+      utm_campaign: payload.utm_campaign || '',
+      utm_content: payload.utm_content || '',
+      utm_term: payload.utm_term || '',
+      utm_ad: payload.utm_ad || '',
+      campaign_id: payload.campaign_id || '',
+      adset_id: payload.adset_id || '',
+      ad_id: payload.ad_id || '',
+      redirect_event_id: payload.redirect_event_id || '',
+      plan: '',
+      value: 0,
+      has_paid_main: false,
+      has_paid_upsell: false,
+      stop_remarketing: false
+    };
 
-    await sendToMeta('ViewContent', user, user.redirect_event_id || user.event_id);
+    await upsertUser(user);
+
+    await sendToMeta('ViewContent', {
+      ...user,
+      event_id: uuidv4()
+    }, user.redirect_event_id || uuidv4());
+
     await sendPlanMessage(chat_id);
-    await scheduleOrderBumps(chat_id);
+    await scheduleUserBumpsInDb(chat_id);
   } catch (err) {
     console.log('START ERROR:', err.response?.data || err.message || err);
     try {
@@ -682,40 +780,76 @@ bot.on('callback_query', async (query) => {
 
     const chat_id = query.message.chat.id;
     const data = query.data;
-    const user = getUser(chat_id);
 
     await bot.answerCallbackQuery(query.id).catch(() => {});
 
     const lockKey = `${chat_id}:${data}`;
     if (!lockAction(lockKey)) return;
 
+    const user = await getUserByChatId(chat_id);
+    if (!user) {
+      return await bot.sendMessage(chat_id, '❌ Não encontrei seu cadastro. Envie /start novamente.');
+    }
+
     if (data === 'plan_week') {
       user.value = 7.42;
       user.plan = 'week';
-      user.event_id = uuidv4();
-      await sendToMeta('InitiateCheckout', user);
+      await updateUserByChatId(chat_id, {
+        value: 7.42,
+        plan: 'week'
+      });
+      await sendToMeta('InitiateCheckout', {
+        ...user,
+        value: 7.42,
+        plan: 'week',
+        event_id: uuidv4()
+      });
       return await sendOrderBumpMessage(chat_id);
     }
 
     if (data === 'plan_vip') {
       user.value = 15.42;
       user.plan = 'vip';
-      user.event_id = uuidv4();
-      await sendToMeta('InitiateCheckout', user);
+      await updateUserByChatId(chat_id, {
+        value: 15.42,
+        plan: 'vip'
+      });
+      await sendToMeta('InitiateCheckout', {
+        ...user,
+        value: 15.42,
+        plan: 'vip',
+        event_id: uuidv4()
+      });
       return await sendOrderBumpMessage(chat_id);
     }
 
     if (data === 'plan_full') {
       user.value = 23.42;
       user.plan = 'full';
-      user.event_id = uuidv4();
-      await sendToMeta('InitiateCheckout', user);
+      await updateUserByChatId(chat_id, {
+        value: 23.42,
+        plan: 'full'
+      });
+      await sendToMeta('InitiateCheckout', {
+        ...user,
+        value: 23.42,
+        plan: 'full',
+        event_id: uuidv4()
+      });
       return await sendOrderBumpMessage(chat_id);
     }
 
     if (data === 'bump_yes') {
-      user.value = roundMoney(Number(user.value || 0) + 4.99);
-      return await goToPayment(chat_id, user, { isUpsell: false });
+      const newValue = roundMoney(Number(user.value || 0) + 4.99);
+
+      await updateUserByChatId(chat_id, {
+        value: newValue
+      });
+
+      return await goToPayment(chat_id, {
+        ...user,
+        value: newValue
+      }, { isUpsell: false });
     }
 
     if (data === 'bump_no') {
@@ -723,38 +857,48 @@ bot.on('callback_query', async (query) => {
     }
 
     if (data === 'upsell_buy') {
-      const upsellUser = {
+      return await goToPayment(chat_id, {
         ...user,
-        value: 10,
-        event_id: uuidv4()
-      };
-
-      return await goToPayment(chat_id, upsellUser, {
+        value: 10
+      }, {
         isUpsell: true,
         forcedAmount: 10
       });
     }
 
     if (data === 'remarketing_pay_now') {
-      if (!user.plan) {
-        user.value = 15.42;
-        user.plan = 'vip';
+      let targetUser = { ...user };
+
+      if (!targetUser.plan) {
+        targetUser.plan = 'vip';
+        targetUser.value = 15.42;
+
+        await updateUserByChatId(chat_id, {
+          plan: 'vip',
+          value: 15.42
+        });
       }
 
-      user.event_id = uuidv4();
-      await sendToMeta('InitiateCheckout', user);
-      return await goToPayment(chat_id, user, { isUpsell: false });
+      await sendToMeta('InitiateCheckout', {
+        ...targetUser,
+        event_id: uuidv4()
+      });
+
+      return await goToPayment(chat_id, targetUser, { isUpsell: false });
     }
 
     if (data === 'remarketing_no') {
-      user.stopRemarketing = true;
-      cancelAllScheduledBumps(chat_id);
+      await updateUserByChatId(chat_id, {
+        stop_remarketing: true
+      });
+
+      await stopAllUserBumps(chat_id);
       return await bot.sendMessage(chat_id, 'Tudo bem.');
     }
 
     if (data === 'check_payment' || data.startsWith('check_payment:')) {
       const txId = data.includes(':') ? data.split(':')[1] : null;
-      const tx = txId ? transactions[txId] : null;
+      const tx = txId ? await getTransactionByTxId(txId) : null;
 
       if (!tx) {
         return await bot.sendMessage(chat_id, '❌ Não encontrei esse pagamento. Gere um novo PIX.');
@@ -769,7 +913,7 @@ bot.on('callback_query', async (query) => {
 
     if (data === 'copy_fallback' || data.startsWith('copy_fallback:')) {
       const txId = data.includes(':') ? data.split(':')[1] : null;
-      const tx = txId ? transactions[txId] : null;
+      const tx = txId ? await getTransactionByTxId(txId) : null;
 
       if (!tx) {
         return await bot.sendMessage(chat_id, '❌ Não encontrei esse código. Gere um novo PIX.');
@@ -833,9 +977,13 @@ app.post(PAYMENT_PATH, async (req, res) => {
       return res.sendStatus(200);
     }
 
-    const tx = transactions[txId];
+    const tx = await getTransactionByTxId(txId);
     if (!tx) {
       console.log('WEBHOOK TX NOT FOUND:', { txId, eventHeader, status, body });
+      return res.sendStatus(200);
+    }
+
+    if (tx.status === 'paid') {
       return res.sendStatus(200);
     }
 
@@ -851,37 +999,43 @@ app.post(PAYMENT_PATH, async (req, res) => {
     }
 
     processedPayments.add(txId);
-    markTransactionPaid(txId);
+    await markTransactionPaidDb(txId);
 
-    const { chat_id, user, upsell } = tx;
-    const liveUser = getUser(chat_id);
+    const user = await getUserByChatId(tx.chat_id);
+    if (!user) {
+      return res.sendStatus(200);
+    }
 
-    if (!upsell) {
-      liveUser.hasPaidMain = true;
-      liveUser.stopRemarketing = true;
-      cancelAllScheduledBumps(chat_id);
+    if (!tx.upsell) {
+      await updateUserByChatId(tx.chat_id, {
+        has_paid_main: true,
+        stop_remarketing: true
+      });
 
-      const purchaseUser = {
+      await stopAllUserBumps(tx.chat_id);
+
+      await sendToMeta('Purchase', {
         ...user,
         value: tx.amount,
         event_id: uuidv4()
-      };
+      });
 
-      await sendToMeta('Purchase', purchaseUser);
-
-      await bot.sendMessage(chat_id, `
+      await bot.sendMessage(tx.chat_id, `
 ✅ PAGAMENTO CONFIRMADO!
 
 Seu acesso está sendo liberado...
 `);
 
-      await sendUpsellMessage(chat_id);
+      await sendUpsellMessage(tx.chat_id);
     } else {
-      liveUser.hasPaidUpsell = true;
-      liveUser.stopRemarketing = true;
-      cancelAllScheduledBumps(chat_id);
+      await updateUserByChatId(tx.chat_id, {
+        has_paid_upsell: true,
+        stop_remarketing: true
+      });
 
-      await bot.sendMessage(chat_id, `
+      await stopAllUserBumps(tx.chat_id);
+
+      await bot.sendMessage(tx.chat_id, `
 🚀 ACESSO TOTAL LIBERADO!
 
 Aproveite todo o conteúdo 🔥
@@ -900,23 +1054,8 @@ app.get('/', (req, res) => {
   res.status(200).send('BOT ONLINE');
 });
 
-// ================= CLEANUP =================
-setInterval(() => {
-  const now = Date.now();
-
-  for (const [chat_id, user] of Object.entries(users)) {
-    if (now - (user.updatedAt || user.createdAt || now) > 7 * 24 * 60 * 60 * 1000) {
-      cancelAllScheduledBumps(chat_id);
-      delete users[chat_id];
-    }
-  }
-
-  for (const [txId, tx] of Object.entries(transactions)) {
-    if (now - (tx.updatedAt || tx.createdAt || now) > 12 * 60 * 60 * 1000) {
-      delete transactions[txId];
-    }
-  }
-}, 30 * 60 * 1000);
+// ================= BUMP LOOP =================
+setInterval(runScheduledBumps, 60 * 1000);
 
 // ================= TELEGRAM WEBHOOK SETUP =================
 async function setupTelegramWebhook() {
