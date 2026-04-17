@@ -26,7 +26,7 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const VIDEO_START = 'BAACAgEAAxkBAANjaeE1lWS7RCCUF3G0cehARZeHIxoAArkGAAIqEglHTEGxhQwHcS87BA';
 const VIDEO_BUMP = 'BAACAgEAAxkBAANlaeE1r7jftHF1Z1ZkDpTLWFFY1_cAAroGAAIqEglHsnlZ68ElDLU7BA';
 
-// Estrutura pronta para futuro downsell
+// ================= DOWNSELL =================
 const DOWNSELL_MEDIA = {
   enabled: false,
   type: 'video', // 'video' | 'photo' | 'document'
@@ -76,10 +76,9 @@ app.use(bodyParser.json());
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ================= MEMORY STATE LEVE =================
-// Aqui fica só deduplicação e cache de token; o estado principal está no Supabase.
 const processedPayments = new Set();
-const actionLock = {};
 const processedMetaEvents = new Set();
+const actionLock = {};
 
 let accessToken = null;
 let accessTokenExpiresAt = 0;
@@ -95,17 +94,6 @@ function roundMoney(value) {
 
 function formatBRL(value) {
   return roundMoney(value).toFixed(2);
-}
-
-function safeBase64JsonDecode(encoded) {
-  try {
-    const normalized = String(encoded || '').trim();
-    if (!normalized) return {};
-    const json = Buffer.from(normalized, 'base64').toString('utf8');
-    return JSON.parse(json);
-  } catch {
-    return {};
-  }
 }
 
 function escapeHtml(text) {
@@ -153,7 +141,42 @@ function sha256(value) {
     .digest('hex');
 }
 
-// ================= SUPABASE HELPERS =================
+function generateShortStartToken() {
+  return crypto.randomBytes(24).toString('base64url');
+}
+
+function buildUserRecord(chat_id, payload = {}) {
+  return {
+    chat_id,
+    fbc: payload.fbc || '',
+    fbp: payload.fbp || '',
+    ip: payload.ip || '',
+    ua: payload.ua || '',
+    lang: payload.lang || '',
+    screen: payload.screen || '',
+    tz: payload.tz || '',
+    referrer: payload.referrer || '',
+    host: payload.host || '',
+    path: payload.path || '',
+    utm_source: payload.utm_source || '',
+    utm_medium: payload.utm_medium || '',
+    utm_campaign: payload.utm_campaign || '',
+    utm_content: payload.utm_content || '',
+    utm_term: payload.utm_term || '',
+    utm_ad: payload.utm_ad || '',
+    campaign_id: payload.campaign_id || '',
+    adset_id: payload.adset_id || '',
+    ad_id: payload.ad_id || '',
+    redirect_event_id: payload.redirect_event_id || '',
+    plan: '',
+    value: 0,
+    has_paid_main: false,
+    has_paid_upsell: false,
+    stop_remarketing: false
+  };
+}
+
+// ================= SUPABASE: USERS =================
 async function upsertUser(user) {
   const payload = {
     chat_id: user.chat_id,
@@ -215,6 +238,7 @@ async function updateUserByChatId(chat_id, updates) {
   if (error) throw error;
 }
 
+// ================= SUPABASE: TRANSACTIONS =================
 async function createOrUpdateTransaction(tx) {
   const payload = {
     tx_id: tx.txId,
@@ -260,6 +284,56 @@ async function markTransactionPaidDb(txId) {
   if (error) throw error;
 }
 
+// ================= SUPABASE: START PAYLOADS =================
+async function createStartPayload(payload) {
+  const token = generateShortStartToken();
+
+  const { error } = await supabase
+    .from('start_payloads')
+    .insert({
+      token,
+      payload,
+      used: false
+    });
+
+  if (error) throw error;
+  return token;
+}
+
+async function consumeStartPayload(token) {
+  const { data, error } = await supabase
+    .from('start_payloads')
+    .select('*')
+    .eq('token', token)
+    .maybeSingle();
+
+  if (error) throw error;
+  if (!data) return null;
+
+  if (!data.used) {
+    await supabase
+      .from('start_payloads')
+      .update({ used: true })
+      .eq('token', token);
+  }
+
+  return data.payload || null;
+}
+
+async function cleanupOldStartPayloads() {
+  const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+  const { error } = await supabase
+    .from('start_payloads')
+    .delete()
+    .lt('created_at', cutoff);
+
+  if (error) {
+    console.log('START PAYLOAD CLEANUP ERROR:', error.message);
+  }
+}
+
+// ================= SUPABASE: BUMPS =================
 async function scheduleUserBumpsInDb(chat_id) {
   const now = Date.now();
 
@@ -323,6 +397,17 @@ async function sendToMeta(event_name, user, overrideEventId = null) {
   processedMetaEvents.add(dedupeKey);
 
   try {
+    const userData = {
+      client_ip_address: user.ip || '',
+      client_user_agent: user.ua || '',
+      fbc: user.fbc || '',
+      fbp: user.fbp || ''
+    };
+
+    if (user.chat_id) {
+      userData.external_id = sha256(user.chat_id);
+    }
+
     const payload = {
       data: [
         {
@@ -330,13 +415,7 @@ async function sendToMeta(event_name, user, overrideEventId = null) {
           event_time: nowSec(),
           event_id: metaEventId,
           action_source: 'website',
-          user_data: {
-            client_ip_address: user.ip || '',
-            client_user_agent: user.ua || '',
-            fbc: user.fbc || '',
-            fbp: user.fbp || '',
-            external_id: user.chat_id ? sha256(user.chat_id) : undefined
-          },
+          user_data: userData,
           custom_data: {
             currency: 'BRL',
             value: roundMoney(user.value || 0),
@@ -661,6 +740,25 @@ async function goToPayment(chat_id, user, options = {}) {
 }
 
 // ================= BUMP WORKER =================
+function getScheduledBumpCopy(index) {
+  const copies = [
+    `🔥 Você entrou e ainda não garantiu seu acesso.\n\nAs vagas promocionais estão acabando e o VIP pode sair do ar a qualquer momento.`,
+    `⚠️ Seu acesso ainda está pendente.\n\nSe quiser entrar com desconto, essa é a melhor hora para finalizar.`,
+    `🚨 Muita gente entra, olha e volta depois.\n\nQuando volta, a promoção já acabou.`,
+    `⏳ Seu benefício ainda está disponível.\n\nMas não dá para garantir por muito tempo.`,
+    `🔥 O conteúdo continua te esperando.\n\nSe quiser aproveitar o valor atual, finalize agora.`,
+    `😈 As melhores pastas e mídias continuam bloqueadas.\n\nSó falta liberar seu acesso.`,
+    `⚠️ Estamos nas últimas vagas promocionais.\n\nDepois disso, o valor pode subir.`,
+    `💥 Últimas horas com essa condição.\n\nSe você quer entrar, esse é o melhor momento.`,
+    `🔥 Seu acesso ainda não foi ativado.\n\nNão deixa para depois e perde a oferta.`,
+    `🚨 Oferta quase encerrada.\n\nAinda dá tempo de entrar pagando menos.`,
+    `⏰ O desconto segue ativo por pouco tempo.\n\nFinalize enquanto ainda está liberado.`,
+    `⚠️ Último aviso.\n\nDepois dessa mensagem, não dá para garantir que o valor continue o mesmo.`
+  ];
+
+  return copies[index] || `⚠️ Sua oferta ainda está disponível por pouco tempo.`;
+}
+
 async function runScheduledBumps() {
   try {
     const bumps = await getDueBumps(50);
@@ -701,60 +799,42 @@ ${getScheduledBumpCopy(index)}
   }
 }
 
-function getScheduledBumpCopy(index) {
-  const copies = [
-    `🔥 Você entrou e ainda não garantiu seu acesso.\n\nAs vagas promocionais estão acabando e o VIP pode sair do ar a qualquer momento.`,
-    `⚠️ Seu acesso ainda está pendente.\n\nSe quiser entrar com desconto, essa é a melhor hora para finalizar.`,
-    `🚨 Muita gente entra, olha e volta depois.\n\nQuando volta, a promoção já acabou.`,
-    `⏳ Seu benefício ainda está disponível.\n\nMas não dá para garantir por muito tempo.`,
-    `🔥 O conteúdo continua te esperando.\n\nSe quiser aproveitar o valor atual, finalize agora.`,
-    `😈 As melhores pastas e mídias continuam bloqueadas.\n\nSó falta liberar seu acesso.`,
-    `⚠️ Estamos nas últimas vagas promocionais.\n\nDepois disso, o valor pode subir.`,
-    `💥 Últimas horas com essa condição.\n\nSe você quer entrar, esse é o melhor momento.`,
-    `🔥 Seu acesso ainda não foi ativado.\n\nNão deixa para depois e perde a oferta.`,
-    `🚨 Oferta quase encerrada.\n\nAinda dá tempo de entrar pagando menos.`,
-    `⏰ O desconto segue ativo por pouco tempo.\n\nFinalize enquanto ainda está liberado.`,
-    `⚠️ Último aviso.\n\nDepois dessa mensagem, não dá para garantir que o valor continue o mesmo.`
-  ];
-
-  return copies[index] || `⚠️ Sua oferta ainda está disponível por pouco tempo.`;
-}
+// ================= ROTA PARA TOKEN CURTO =================
+app.post('/prepare-start', async (req, res) => {
+  try {
+    const payload = req.body || {};
+    const token = await createStartPayload(payload);
+    return res.status(200).json({ token });
+  } catch (err) {
+    console.log('PREPARE START ERROR:', err.response?.data || err.message || err);
+    return res.status(500).json({ error: 'prepare_start_failed' });
+  }
+});
 
 // ================= TELEGRAM START =================
-bot.onText(/\/start(.*)/, async (msg, match) => {
+bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   try {
     const chat_id = msg.chat.id;
-    const param = match?.[1]?.trim() || '';
-    const payload = safeBase64JsonDecode(param);
+    const startToken = (match?.[1] || '').trim();
 
-    const user = {
+    console.log('START DEBUG:', {
       chat_id,
-      fbc: payload.fbc || '',
-      fbp: payload.fbp || '',
-      ip: payload.ip || '',
-      ua: payload.ua || '',
-      lang: payload.lang || '',
-      screen: payload.screen || '',
-      tz: payload.tz || '',
-      referrer: payload.referrer || '',
-      host: payload.host || '',
-      path: payload.path || '',
-      utm_source: payload.utm_source || '',
-      utm_medium: payload.utm_medium || '',
-      utm_campaign: payload.utm_campaign || '',
-      utm_content: payload.utm_content || '',
-      utm_term: payload.utm_term || '',
-      utm_ad: payload.utm_ad || '',
-      campaign_id: payload.campaign_id || '',
-      adset_id: payload.adset_id || '',
-      ad_id: payload.ad_id || '',
-      redirect_event_id: payload.redirect_event_id || '',
-      plan: '',
-      value: 0,
-      has_paid_main: false,
-      has_paid_upsell: false,
-      stop_remarketing: false
-    };
+      text: msg.text,
+      startToken
+    });
+
+    let payload = {};
+
+    if (startToken) {
+      const dbPayload = await consumeStartPayload(startToken);
+      if (dbPayload) {
+        payload = dbPayload;
+      }
+    }
+
+    console.log('PAYLOAD DECODED:', payload);
+
+    const user = buildUserRecord(chat_id, payload);
 
     await upsertUser(user);
 
@@ -770,6 +850,35 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
     try {
       await bot.sendMessage(msg.chat.id, '❌ Erro ao iniciar.');
     } catch {}
+  }
+});
+
+// ================= COMANDOS EXTRAS =================
+bot.onText(/^\/status$/, async (msg) => {
+  try {
+    const user = await getUserByChatId(msg.chat.id);
+
+    if (!user) {
+      return await bot.sendMessage(msg.chat.id, '❌ Não encontrei seu cadastro. Envie /start.');
+    }
+
+    return await bot.sendMessage(msg.chat.id, `
+📊 STATUS DA SUA CONTA
+
+Plano: ${user.plan || 'Não definido'}
+Pagamento principal: ${user.has_paid_main ? '✅ Pago' : '❌ Pendente'}
+Upsell: ${user.has_paid_upsell ? '✅ Pago' : '❌ Não pago'}
+`);
+  } catch (err) {
+    console.log('STATUS ERROR:', err);
+  }
+});
+
+bot.onText(/^\/suporte$/, async (msg) => {
+  try {
+    await bot.sendMessage(msg.chat.id, '💬 Suporte em breve.');
+  } catch (err) {
+    console.log('SUPORTE ERROR:', err);
   }
 });
 
@@ -792,50 +901,50 @@ bot.on('callback_query', async (query) => {
     }
 
     if (data === 'plan_week') {
-      user.value = 7.42;
-      user.plan = 'week';
       await updateUserByChatId(chat_id, {
         value: 7.42,
         plan: 'week'
       });
+
       await sendToMeta('InitiateCheckout', {
         ...user,
         value: 7.42,
         plan: 'week',
         event_id: uuidv4()
       });
+
       return await sendOrderBumpMessage(chat_id);
     }
 
     if (data === 'plan_vip') {
-      user.value = 15.42;
-      user.plan = 'vip';
       await updateUserByChatId(chat_id, {
         value: 15.42,
         plan: 'vip'
       });
+
       await sendToMeta('InitiateCheckout', {
         ...user,
         value: 15.42,
         plan: 'vip',
         event_id: uuidv4()
       });
+
       return await sendOrderBumpMessage(chat_id);
     }
 
     if (data === 'plan_full') {
-      user.value = 23.42;
-      user.plan = 'full';
       await updateUserByChatId(chat_id, {
         value: 23.42,
         plan: 'full'
       });
+
       await sendToMeta('InitiateCheckout', {
         ...user,
         value: 23.42,
         plan: 'full',
         event_id: uuidv4()
       });
+
       return await sendOrderBumpMessage(chat_id);
     }
 
@@ -1054,10 +1163,20 @@ app.get('/', (req, res) => {
   res.status(200).send('BOT ONLINE');
 });
 
-// ================= BUMP LOOP =================
-setInterval(runScheduledBumps, 60 * 1000);
+// ================= SET COMMANDS =================
+async function setupCommands() {
+  try {
+    await bot.setMyCommands([
+      { command: 'start', description: '🚀 Iniciar o bot' },
+      { command: 'status', description: '📊 Ver minha assinatura' },
+      { command: 'suporte', description: '💬 Falar com suporte' }
+    ]);
+  } catch (err) {
+    console.log('SET COMMANDS ERROR:', err.response?.data || err.message || err);
+  }
+}
 
-// ================= TELEGRAM WEBHOOK SETUP =================
+// ================= WEBHOOK SETUP =================
 async function setupTelegramWebhook() {
   try {
     await bot.deleteWebHook().catch(() => {});
@@ -1068,6 +1187,10 @@ async function setupTelegramWebhook() {
     console.log('TELEGRAM WEBHOOK ERROR:', err.response?.data || err.message || err);
   }
 }
+
+// ================= WORKERS =================
+setInterval(runScheduledBumps, 60 * 1000);
+setInterval(cleanupOldStartPayloads, 6 * 60 * 60 * 1000);
 
 // ================= SAFETY =================
 process.on('unhandledRejection', (err) => {
@@ -1082,4 +1205,5 @@ process.on('uncaughtException', (err) => {
 app.listen(PORT, async () => {
   console.log(`BOT ONLINE NA PORTA ${PORT}`);
   await setupTelegramWebhook();
+  await setupCommands();
 });
