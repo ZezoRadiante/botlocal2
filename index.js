@@ -162,6 +162,7 @@ function buildFallbackCustomer(chat_id) {
 
 function extractTriboPixCode(data) {
   return (
+    data?.pix?.pix_qr_code ||
     data?.pix_code ||
     data?.pixCode ||
     data?.pix?.payload ||
