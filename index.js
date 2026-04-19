@@ -12,20 +12,30 @@ const TOKEN = process.env.BOT_TOKEN;
 const PORT = Number(process.env.PORT || 3000);
 const BASE_URL = (process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
 
-const SYNCPAY_URL = (process.env.SYNCPAY_BASE_URL || '').replace(/\/+$/, '');
-const CLIENT_ID = process.env.SYNCPAY_CLIENT_ID;
-const CLIENT_SECRET = process.env.SYNCPAY_CLIENT_SECRET;
+// ================= TRIBOPAY =================
+const TRIBOPAY_BASE_URL = (process.env.TRIBOPAY_BASE_URL || 'https://api.tribopay.com.br/api').replace(/\/+$/, '');
+const TRIBOPAY_API_TOKEN = process.env.TRIBOPAY_API_TOKEN;
+const TRIBOPAY_OFFER_HASH = process.env.TRIBOPAY_OFFER_HASH;
+const TRIBOPAY_POSTBACK_SECRET = process.env.TRIBOPAY_POSTBACK_SECRET || '';
 
+// ================= META =================
 const META_PIXEL_ID = '1505014021315132';
 const META_TOKEN = process.env.META_TOKEN;
 const META_TEST_EVENT_CODE = process.env.META_TEST_EVENT_CODE || '';
 
+// ================= SUPABASE =================
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
+// ================= CUSTOMER DEFAULT =================
+const DEFAULT_CUSTOMER_NAME = process.env.DEFAULT_CUSTOMER_NAME || 'Cliente Telegram';
+const DEFAULT_CUSTOMER_EMAIL_DOMAIN = process.env.DEFAULT_CUSTOMER_EMAIL_DOMAIN || 'gmail.com';
+const DEFAULT_CUSTOMER_PHONE = process.env.DEFAULT_CUSTOMER_PHONE || '11999999999';
+const DEFAULT_CUSTOMER_DOCUMENT = process.env.DEFAULT_CUSTOMER_DOCUMENT || '12345678901';
+
 // ================= MEDIA =================
-const VIDEO_START = 'BAACAgEAAxkBAANjaeE1lWS7RCCUF3G0cehARZeHIxoAArkGAAIqEglHTEGxhQwHcS87BA';
-const VIDEO_BUMP = 'BAACAgEAAxkBAANlaeE1r7jftHF1Z1ZkDpTLWFFY1_cAAroGAAIqEglHsnlZ68ElDLU7BA';
+const VIDEO_START = process.env.VIDEO_START || 'BAACAgEAAxkBAANjaeE1lWS7RCCUF3G0cehARZeHIxoAArkGAAIqEglHTEGxhQwHcS87BA';
+const VIDEO_BUMP = process.env.VIDEO_BUMP || 'BAACAgEAAxkBAANlaeE1r7jftHF1Z1ZkDpTLWFFY1_cAAroGAAIqEglHsnlZ68ElDLU7BA';
 
 // ================= DOWNSELL =================
 const DOWNSELL_MEDIA = {
@@ -58,9 +68,8 @@ const ORDER_BUMP_SCHEDULES = [
 // ================= VALIDATION =================
 if (!TOKEN) throw new Error('BOT_TOKEN não configurado');
 if (!BASE_URL) throw new Error('RENDER_EXTERNAL_URL não configurado');
-if (!SYNCPAY_URL) throw new Error('SYNCPAY_BASE_URL não configurado');
-if (!CLIENT_ID) throw new Error('SYNCPAY_CLIENT_ID não configurado');
-if (!CLIENT_SECRET) throw new Error('SYNCPAY_CLIENT_SECRET não configurado');
+if (!TRIBOPAY_API_TOKEN) throw new Error('TRIBOPAY_API_TOKEN não configurado');
+if (!TRIBOPAY_OFFER_HASH) throw new Error('TRIBOPAY_OFFER_HASH não configurado');
 if (!META_TOKEN) throw new Error('META_TOKEN não configurado');
 if (!SUPABASE_URL) throw new Error('SUPABASE_URL não configurado');
 if (!SUPABASE_SERVICE_ROLE_KEY) throw new Error('SUPABASE_SERVICE_ROLE_KEY não configurado');
@@ -76,19 +85,21 @@ const app = express();
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type']
+  allowedHeaders: ['Content-Type', 'x-tribopay-secret']
 }));
-app.use(bodyParser.json());
+
+app.use(bodyParser.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf ? buf.toString('utf8') : '';
+  }
+}));
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-// ================= MEMORY STATE LEVE =================
+// ================= MEMORY STATE =================
 const processedPayments = new Set();
 const processedMetaEvents = new Set();
 const actionLock = {};
-
-let accessToken = null;
-let accessTokenExpiresAt = 0;
 
 // ================= HELPERS =================
 function nowSec() {
@@ -97,6 +108,14 @@ function nowSec() {
 
 function roundMoney(value) {
   return Number(Number(value || 0).toFixed(2));
+}
+
+function toCents(value) {
+  return Math.round(Number(value || 0) * 100);
+}
+
+function centsToMoney(cents) {
+  return roundMoney(Number(cents || 0) / 100);
 }
 
 function formatBRL(value) {
@@ -110,35 +129,15 @@ function escapeHtml(text) {
     .replace(/>/g, '&gt;');
 }
 
+function onlyDigits(value) {
+  return String(value || '').replace(/\D/g, '');
+}
+
 function lockAction(key, ttlMs = 5000) {
   if (actionLock[key]) return false;
   actionLock[key] = true;
   setTimeout(() => delete actionLock[key], ttlMs);
   return true;
-}
-
-function extractTransactionId(data) {
-  return (
-    data?.id ||
-    data?.data?.id ||
-    data?.identifier ||
-    data?.data?.identifier ||
-    data?.reference_id ||
-    data?.transaction_id ||
-    null
-  );
-}
-
-function extractPixCode(data) {
-  return (
-    data?.pix_code ||
-    data?.data?.pix_code ||
-    data?.qr_code ||
-    data?.data?.qr_code ||
-    data?.pix?.payload ||
-    data?.data?.pix?.payload ||
-    null
-  );
 }
 
 function sha256(value) {
@@ -152,7 +151,61 @@ function generateShortStartToken() {
   return crypto.randomBytes(24).toString('base64url');
 }
 
+function buildFallbackCustomer(chat_id) {
+  return {
+    name: DEFAULT_CUSTOMER_NAME,
+    email: `user_${chat_id}@${DEFAULT_CUSTOMER_EMAIL_DOMAIN}`,
+    phone_number: onlyDigits(DEFAULT_CUSTOMER_PHONE) || '11999999999',
+    document: onlyDigits(DEFAULT_CUSTOMER_DOCUMENT) || '12345678901'
+  };
+}
+
+function extractTriboPixCode(data) {
+  return (
+    data?.pix_code ||
+    data?.pixCode ||
+    data?.pix?.payload ||
+    data?.pix?.code ||
+    data?.pix_qr_code ||
+    data?.qr_code ||
+    data?.qrCode ||
+    data?.digitable_line ||
+    data?.copy_paste ||
+    data?.copyAndPaste ||
+    data?.payment_data?.pix_code ||
+    data?.payment_data?.qr_code ||
+    data?.data?.pix_code ||
+    data?.data?.pix?.payload ||
+    null
+  );
+}
+
+function extractTriboQrCodeImage(data) {
+  return (
+    data?.qr_code_base64 ||
+    data?.pix?.qr_code_base64 ||
+    data?.pix?.qr_code_image ||
+    data?.payment_data?.qr_code_base64 ||
+    data?.data?.qr_code_base64 ||
+    null
+  );
+}
+
+function extractTriboTransactionHash(data) {
+  return (
+    data?.transaction_hash ||
+    data?.hash ||
+    data?.id ||
+    data?.data?.transaction_hash ||
+    data?.data?.hash ||
+    data?.data?.id ||
+    null
+  );
+}
+
 function buildUserRecord(chat_id, payload = {}) {
+  const fallbackCustomer = buildFallbackCustomer(chat_id);
+
   return {
     chat_id,
     fbc: payload.fbc || '',
@@ -175,6 +228,10 @@ function buildUserRecord(chat_id, payload = {}) {
     adset_id: payload.adset_id || '',
     ad_id: payload.ad_id || '',
     redirect_event_id: payload.redirect_event_id || '',
+    customer_name: payload.customer_name || fallbackCustomer.name,
+    customer_email: payload.customer_email || fallbackCustomer.email,
+    customer_phone: onlyDigits(payload.customer_phone || fallbackCustomer.phone_number),
+    customer_document: onlyDigits(payload.customer_document || fallbackCustomer.document),
     plan: '',
     value: 0,
     has_paid_main: false,
@@ -207,6 +264,10 @@ async function upsertUser(user) {
     adset_id: user.adset_id || '',
     ad_id: user.ad_id || '',
     redirect_event_id: user.redirect_event_id || '',
+    customer_name: user.customer_name || '',
+    customer_email: user.customer_email || '',
+    customer_phone: user.customer_phone || '',
+    customer_document: user.customer_document || '',
     plan: user.plan || '',
     value: Number(user.value || 0),
     has_paid_main: !!user.has_paid_main,
@@ -257,6 +318,9 @@ async function createOrUpdateTransaction(tx) {
     pix_code: tx.pixCode || '',
     plan: tx.plan || '',
     meta_purchase_sent: !!tx.meta_purchase_sent,
+    gateway: 'tribopay',
+    payment_method: tx.payment_method || 'pix',
+    gateway_paid_at: tx.gateway_paid_at || null,
     updated_at: new Date().toISOString()
   };
 
@@ -278,12 +342,13 @@ async function getTransactionByTxId(txId) {
   return data;
 }
 
-async function markTransactionPaidDb(txId) {
+async function markTransactionPaidDb(txId, paidAt = null) {
   const { error } = await supabase
     .from('transactions')
     .update({
       status: 'paid',
-      paid_at: new Date().toISOString(),
+      paid_at: paidAt || new Date().toISOString(),
+      gateway_paid_at: paidAt || null,
       updated_at: new Date().toISOString()
     })
     .eq('tx_id', txId);
@@ -415,6 +480,18 @@ async function sendToMeta(event_name, user, overrideEventId = null) {
       userData.external_id = sha256(user.chat_id);
     }
 
+    if (user.customer_email) {
+      userData.em = sha256(user.customer_email);
+    }
+
+    if (user.customer_phone) {
+      userData.ph = sha256(user.customer_phone);
+    }
+
+    if (user.customer_document) {
+      userData.db = sha256(user.customer_document);
+    }
+
     const payload = {
       data: [
         {
@@ -433,7 +510,8 @@ async function sendToMeta(event_name, user, overrideEventId = null) {
             utm_term: user.utm_term || '',
             campaign_id: user.campaign_id || '',
             adset_id: user.adset_id || '',
-            ad_id: user.ad_id || ''
+            ad_id: user.ad_id || '',
+            plan: user.plan || ''
           }
         }
       ]
@@ -454,60 +532,93 @@ async function sendToMeta(event_name, user, overrideEventId = null) {
   }
 }
 
-// ================= SYNCPAY =================
-async function getToken() {
-  const now = Date.now();
+// ================= TRIBOPAY =================
+async function createTriboPayPix(user, amount, options = {}) {
+  const {
+    isUpsell = false,
+    isDownsell = false
+  } = options;
 
-  if (accessToken && now < accessTokenExpiresAt - 60000) {
-    return accessToken;
-  }
+  const customer = {
+    name: user.customer_name || DEFAULT_CUSTOMER_NAME,
+    email: user.customer_email || `user_${user.chat_id}@${DEFAULT_CUSTOMER_EMAIL_DOMAIN}`,
+    phone_number: onlyDigits(user.customer_phone || DEFAULT_CUSTOMER_PHONE),
+    document: onlyDigits(user.customer_document || DEFAULT_CUSTOMER_DOCUMENT)
+  };
 
-  const res = await axios.post(
-    `${SYNCPAY_URL}/api/partner/v1/auth-token`,
-    {
-      client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET
+  const cents = toCents(amount);
+
+  const body = {
+    amount: cents,
+    offer_hash: TRIBOPAY_OFFER_HASH,
+    payment_method: 'pix',
+    customer,
+    cart: [
+      {
+        product_hash: TRIBOPAY_OFFER_HASH,
+        title: isUpsell
+          ? 'Tarifa de Segurança'
+          : isDownsell
+            ? 'Oferta Especial'
+            : 'Acesso VIP',
+        cover: null,
+        price: cents,
+        quantity: 1,
+        operation_type: 1,
+        tangible: false
+      }
+    ],
+    expire_in_days: 1,
+    transaction_origin: 'api',
+    tracking: {
+      src: user.host || '',
+      utm_source: user.utm_source || '',
+      utm_medium: user.utm_medium || '',
+      utm_campaign: user.utm_campaign || '',
+      utm_term: user.utm_term || '',
+      utm_content: user.utm_content || ''
     },
-    {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 20000
-    }
-  );
+    postback_url: `${BASE_URL}${PAYMENT_PATH}`
+  };
 
-  if (!res.data?.access_token) {
-    throw new Error(`Auth SyncPay inválido: ${JSON.stringify(res.data)}`);
+  const headers = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json'
+  };
+
+  if (TRIBOPAY_POSTBACK_SECRET) {
+    headers['x-tribopay-secret'] = TRIBOPAY_POSTBACK_SECRET;
   }
-
-  accessToken = res.data.access_token;
-  accessTokenExpiresAt = now + (Number(res.data?.expires_in || 3600) * 1000);
-
-  return accessToken;
-}
-
-async function createSyncPayCashIn(amount) {
-  const token = await getToken();
 
   const response = await axios.post(
-    `${SYNCPAY_URL}/api/partner/v1/cash-in`,
-    { amount: roundMoney(amount) },
+    `${TRIBOPAY_BASE_URL}/public/v1/transactions?api_token=${encodeURIComponent(TRIBOPAY_API_TOKEN)}`,
+    body,
     {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      },
+      headers,
       timeout: 25000
     }
   );
 
-  const data = response.data;
-  const txId = extractTransactionId(data);
-  const pixCode = extractPixCode(data);
+  const data = response.data || {};
+  const txId = extractTriboTransactionHash(data);
+  const pixCode = extractTriboPixCode(data);
+  const qrCodeImage = extractTriboQrCodeImage(data);
 
-  if (!txId || !pixCode) {
-    throw new Error(`Resposta cash-in inesperada da SyncPay: ${JSON.stringify(data)}`);
+  if (!txId) {
+    throw new Error(`Resposta TriboPay sem transaction_hash: ${JSON.stringify(data)}`);
   }
 
-  return { txId, pixCode, raw: data };
+  if (!pixCode) {
+    console.log('TRIBOPAY WARNING: resposta sem pix_code claro:', data);
+    throw new Error(`Resposta TriboPay sem código PIX: ${JSON.stringify(data)}`);
+  }
+
+  return {
+    txId,
+    pixCode,
+    qrCodeImage,
+    raw: data
+  };
 }
 
 // ================= MEDIA SENDERS =================
@@ -550,7 +661,7 @@ async function sendDownsellMedia(chat_id) {
   }
 }
 
-// ================= COPY EXATA DO FUNIL =================
+// ================= COPY DO FUNIL =================
 async function sendPlanMessage(chat_id) {
   await sendOptionalVideo(chat_id, VIDEO_START, 'START VIDEO');
 
@@ -660,7 +771,9 @@ async function sendPixCheckoutMessage(chat_id, txId, amount, pixCode) {
     '<b>NÃO ESQUEÇA DE APERTAR EM CONFERIR PAGAMENTO APÓS FINALIZAR!!</b>',
     '',
     '👇 Toque no código para copiar e pague no seu app de banco.',
-    'Assim que confirmar, eu te chamo aqui na hora!'
+    'Assim que confirmar, eu te chamo aqui na hora!',
+    '',
+    `<b>Valor:</b> R$ ${formatBRL(amount)}`
   ].join('\n');
 
   await bot.sendMessage(chat_id, introMessage, {
@@ -673,7 +786,7 @@ async function sendPixCheckoutMessage(chat_id, txId, amount, pixCode) {
     parse_mode: 'HTML'
   });
 
-  await bot.sendMessage(chat_id, 'Estou segurando sua vaga por 5 minutos... ⏳');
+  await bot.sendMessage(chat_id, 'Estou segurando sua vaga por alguns minutos... ⏳');
 
   const keyboard = [
     [{ text: '✅ Verificar Status', callback_data: `check_payment:${txId}` }]
@@ -719,7 +832,10 @@ async function goToPayment(chat_id, user, options = {}) {
       throw new Error(`Valor inválido para cobrança: ${amount}`);
     }
 
-    const { txId, pixCode, raw } = await createSyncPayCashIn(amount);
+    const { txId, pixCode, raw } = await createTriboPayPix(user, amount, {
+      isUpsell,
+      isDownsell
+    });
 
     await createOrUpdateTransaction({
       txId,
@@ -729,10 +845,11 @@ async function goToPayment(chat_id, user, options = {}) {
       downsell: isDownsell,
       pixCode,
       plan: user.plan || '',
-      status: 'pending'
+      status: 'pending',
+      payment_method: 'pix'
     });
 
-    console.log('SYNCPAY CASHIN OK:', raw);
+    console.log('TRIBOPAY TRANSACTION OK:', raw);
 
     await sendPixCheckoutMessage(chat_id, txId, amount, pixCode);
   } catch (err) {
@@ -1074,21 +1191,45 @@ app.post(TELEGRAM_PATH, (req, res) => {
 app.post(PAYMENT_PATH, async (req, res) => {
   try {
     const body = req.body || {};
-    const data = body.data || body;
-    const eventHeader = req.headers['event'];
+
+    if (TRIBOPAY_POSTBACK_SECRET) {
+      const secretHeader = req.headers['x-tribopay-secret'];
+      if (secretHeader !== TRIBOPAY_POSTBACK_SECRET) {
+        console.log('WEBHOOK SECRET INVALID');
+        return res.sendStatus(401);
+      }
+    }
 
     const txId =
-      data?.identifier ||
-      data?.id ||
-      body?.identifier ||
-      body?.id;
+      body.transaction_hash ||
+      body?.data?.transaction_hash ||
+      body?.transaction?.transaction_hash ||
+      body?.hash ||
+      body?.id ||
+      null;
 
     const status =
-      data?.status ||
-      body?.status ||
+      body.status ||
+      body?.data?.status ||
+      body?.transaction?.status ||
       '';
 
-    if (!txId) return res.sendStatus(200);
+    const paidAt =
+      body.paid_at ||
+      body?.data?.paid_at ||
+      body?.transaction?.paid_at ||
+      null;
+
+    const paymentMethod =
+      body.payment_method ||
+      body?.data?.payment_method ||
+      body?.transaction?.payment_method ||
+      'pix';
+
+    if (!txId) {
+      console.log('WEBHOOK WITHOUT TXID:', body);
+      return res.sendStatus(200);
+    }
 
     if (processedPayments.has(txId)) {
       return res.sendStatus(200);
@@ -1096,7 +1237,7 @@ app.post(PAYMENT_PATH, async (req, res) => {
 
     const tx = await getTransactionByTxId(txId);
     if (!tx) {
-      console.log('WEBHOOK TX NOT FOUND:', { txId, eventHeader, status, body });
+      console.log('WEBHOOK TX NOT FOUND:', { txId, status, body });
       return res.sendStatus(200);
     }
 
@@ -1104,19 +1245,19 @@ app.post(PAYMENT_PATH, async (req, res) => {
       return res.sendStatus(200);
     }
 
-    const paid =
-      status === 'completed' ||
-      status === 'paid' ||
-      status === 'approved' ||
-      body?.paid === true;
+    const paid = status === 'paid';
 
     if (!paid) {
-      console.log('WEBHOOK NOT PAID YET:', { txId, eventHeader, status });
+      console.log('WEBHOOK NOT PAID YET:', { txId, status, paymentMethod });
       return res.sendStatus(200);
     }
 
     processedPayments.add(txId);
-    await markTransactionPaidDb(txId);
+
+    await markTransactionPaidDb(
+      txId,
+      paidAt ? new Date(paidAt).toISOString() : new Date().toISOString()
+    );
 
     const user = await getUserByChatId(tx.chat_id);
     if (!user) {
@@ -1134,6 +1275,7 @@ app.post(PAYMENT_PATH, async (req, res) => {
       await sendToMeta('Purchase', {
         ...user,
         value: tx.amount,
+        plan: tx.plan || user.plan || '',
         event_id: uuidv4()
       });
 
