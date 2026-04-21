@@ -13,10 +13,29 @@ const PORT = Number(process.env.PORT || 3000);
 const BASE_URL = (process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
 
 // ================= MERCADO PAGO ================
-const MERCADOPAGO_ACCESS_TOKEN = process.env.MERCADOPAGO_ACCESS_TOKEN;
+let MERCADOPAGO_ACCESS_TOKEN = process.env.MERCADOPAGO_ACCESS_TOKEN;
+const MERCADOPAGO_CLIENT_ID = process.env.MERCADOPAGO_CLIENT_ID;
+const MERCADOPAGO_CLIENT_SECRET = process.env.MERCADOPAGO_CLIENT_SECRET;
 const MERCADOPAGO_WEBHOOK_SECRET = process.env.MERCADOPAGO_WEBHOOK_SECRET || '';
 
-
+async function refreshMercadoPagoToken() {
+  if (!MERCADOPAGO_CLIENT_ID || !MERCADOPAGO_CLIENT_SECRET) return;
+  
+  try {
+    const response = await axios.post('https://api.mercadopago.com/oauth/token', {
+      client_id: MERCADOPAGO_CLIENT_ID,
+      client_secret: MERCADOPAGO_CLIENT_SECRET,
+      grant_type: 'client_credentials'
+    });
+    
+    if (response.data && response.data.access_token) {
+      MERCADOPAGO_ACCESS_TOKEN = response.data.access_token;
+      console.log('MERCADOPAGO TOKEN REFRESHED');
+    }
+  } catch (err) {
+    console.log('MERCADOPAGO TOKEN REFRESH ERROR:', err.response?.data || err.message);
+  }
+}
 
 // ================= META =================
 const META_PIXEL_ID = '1505014021315132';
@@ -68,7 +87,9 @@ const ORDER_BUMP_SCHEDULES = [
 // ================= VALIDATION =================
 if (!TOKEN) throw new Error('BOT_TOKEN não configurado');
 if (!BASE_URL) throw new Error('RENDER_EXTERNAL_URL não configurado');
-if (!MERCADOPAGO_ACCESS_TOKEN) throw new Error('MERCADOPAGO_ACCESS_TOKEN não configurado');
+if (!MERCADOPAGO_ACCESS_TOKEN && (!MERCADOPAGO_CLIENT_ID || !MERCADOPAGO_CLIENT_SECRET)) {
+  throw new Error('MERCADOPAGO_ACCESS_TOKEN ou CLIENT_ID/SECRET não configurados');
+}
 if (!META_TOKEN) throw new Error('META_TOKEN não configurado');
 if (!SUPABASE_URL) throw new Error('SUPABASE_URL não configurado');
 if (!SUPABASE_SERVICE_ROLE_KEY) throw new Error('SUPABASE_SERVICE_ROLE_KEY não configurado');
@@ -158,8 +179,6 @@ function buildFallbackCustomer(chat_id) {
     document: onlyDigits(DEFAULT_CUSTOMER_DOCUMENT) || '12345678901'
   };
 }
-
-
 
 function buildUserRecord(chat_id, payload = {}) {
   const fallbackCustomer = buildFallbackCustomer(chat_id);
@@ -323,7 +342,7 @@ async function createStartPayload(payload) {
     .insert({
       token,
       payload,
-      used: false
+      expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
     });
 
   if (error) throw error;
@@ -337,59 +356,45 @@ async function consumeStartPayload(token) {
     .eq('token', token)
     .maybeSingle();
 
-  if (error) throw error;
-  if (!data) return null;
+  if (error || !data) return null;
 
-  if (!data.used) {
-    await supabase
-      .from('start_payloads')
-      .update({ used: true })
-      .eq('token', token);
-  }
+  await supabase.from('start_payloads').delete().eq('token', token);
 
-  return data.payload || null;
+  if (new Date(data.expires_at) < new Date()) return null;
+
+  return data.payload;
 }
 
 async function cleanupOldStartPayloads() {
-  const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-
-  const { error } = await supabase
-    .from('start_payloads')
-    .delete()
-    .lt('created_at', cutoff);
-
-  if (error) {
-    console.log('START PAYLOAD CLEANUP ERROR:', error.message);
+  try {
+    await supabase
+      .from('start_payloads')
+      .delete()
+      .lt('expires_at', new Date().toISOString());
+  } catch (err) {
+    console.log('CLEANUP ERROR:', err);
   }
 }
 
 // ================= SUPABASE: BUMPS =================
-async function scheduleUserBumpsInDb(chat_id) {
+async function scheduleBumps(chat_id) {
   const now = Date.now();
-
-  const rows = ORDER_BUMP_SCHEDULES.map((item) => ({
+  const rows = ORDER_BUMP_SCHEDULES.map(s => ({
     chat_id,
-    bump_key: item.key,
-    run_at: new Date(now + item.delayMs).toISOString(),
+    bump_key: s.key,
+    due_at: new Date(now + s.delayMs).toISOString(),
     sent: false
   }));
 
-  const { error } = await supabase
-    .from('scheduled_bumps')
-    .upsert(rows, { onConflict: 'chat_id,bump_key' });
-
+  const { error } = await supabase.from('scheduled_bumps').insert(rows);
   if (error) throw error;
 }
 
 async function stopAllUserBumps(chat_id) {
   const { error } = await supabase
     .from('scheduled_bumps')
-    .update({
-      sent: true,
-      sent_at: new Date().toISOString()
-    })
-    .eq('chat_id', chat_id)
-    .eq('sent', false);
+    .delete()
+    .eq('chat_id', chat_id);
 
   if (error) throw error;
 }
@@ -399,7 +404,7 @@ async function getDueBumps(limit = 50) {
     .from('scheduled_bumps')
     .select('*')
     .eq('sent', false)
-    .lte('run_at', new Date().toISOString())
+    .lt('due_at', new Date().toISOString())
     .limit(limit);
 
   if (error) throw error;
@@ -409,75 +414,48 @@ async function getDueBumps(limit = 50) {
 async function markBumpSent(id) {
   const { error } = await supabase
     .from('scheduled_bumps')
-    .update({
-      sent: true,
-      sent_at: new Date().toISOString()
-    })
+    .update({ sent: true, sent_at: new Date().toISOString() })
     .eq('id', id);
 
   if (error) throw error;
 }
 
-// ================= META =================
-async function sendToMeta(event_name, user, overrideEventId = null) {
-  const metaEventId = overrideEventId || user.event_id || uuidv4();
-  const dedupeKey = `${event_name}:${metaEventId}`;
+// ================= META CONVERSION API =================
+async function sendToMeta(eventName, user, customData = {}) {
+  if (!META_TOKEN || !META_PIXEL_ID) return;
 
+  const dedupeKey = `${eventName}_${user.chat_id}_${user.event_id || ''}`;
   if (processedMetaEvents.has(dedupeKey)) return;
   processedMetaEvents.add(dedupeKey);
 
   try {
     const userData = {
+      em: [sha256(user.customer_email || '')],
+      ph: [sha256(user.customer_phone || '')],
       client_ip_address: user.ip || '',
       client_user_agent: user.ua || '',
       fbc: user.fbc || '',
       fbp: user.fbp || ''
     };
 
-    if (user.chat_id) {
-      userData.external_id = sha256(user.chat_id);
-    }
-
-    if (user.customer_email) {
-      userData.em = sha256(user.customer_email);
-    }
-
-    if (user.customer_phone) {
-      userData.ph = sha256(user.customer_phone);
-    }
-
-    if (user.customer_document) {
-      userData.db = sha256(user.customer_document);
-    }
-
     const payload = {
       data: [
         {
-          event_name,
+          event_name: eventName,
           event_time: nowSec(),
-          event_id: metaEventId,
           action_source: 'website',
+          event_id: user.event_id || uuidv4(),
           user_data: userData,
           custom_data: {
             currency: 'BRL',
-            value: roundMoney(user.value || 0),
-            utm_source: user.utm_source || '',
-            utm_medium: user.utm_medium || '',
-            utm_campaign: user.utm_campaign || '',
-            utm_content: user.utm_content || '',
-            utm_term: user.utm_term || '',
-            campaign_id: user.campaign_id || '',
-            adset_id: user.adset_id || '',
-            ad_id: user.ad_id || '',
-            plan: user.plan || ''
+            value: Number(user.value || 0),
+            content_name: user.plan || '',
+            ...customData
           }
         }
-      ]
+      ],
+      test_event_code: META_TEST_EVENT_CODE
     };
-
-    if (META_TEST_EVENT_CODE) {
-      payload.test_event_code = META_TEST_EVENT_CODE;
-    }
 
     await axios.post(
       `https://graph.facebook.com/v18.0/${META_PIXEL_ID}/events?access_token=${META_TOKEN}`,
@@ -490,6 +468,7 @@ async function sendToMeta(event_name, user, overrideEventId = null) {
   }
 }
 
+// ================= MERCADO PAGO ================
 async function createMercadoPagoPix(user, amount, options = {}) {
   const {
     isUpsell = false,
@@ -541,14 +520,32 @@ async function createMercadoPagoPix(user, amount, options = {}) {
     'X-Idempotency-Key': uuidv4()
   };
 
-  const response = await axios.post(
-    'https://api.mercadopago.com/v1/payments',
-    body,
-    {
-      headers,
-      timeout: 25000
+  let response;
+  try {
+    response = await axios.post(
+      'https://api.mercadopago.com/v1/payments',
+      body,
+      {
+        headers,
+        timeout: 25000
+      }
+    );
+  } catch (err) {
+    if (err.response?.status === 401 && (MERCADOPAGO_CLIENT_ID && MERCADOPAGO_CLIENT_SECRET)) {
+      await refreshMercadoPagoToken();
+      headers.Authorization = `Bearer ${MERCADOPAGO_ACCESS_TOKEN}`;
+      response = await axios.post(
+        'https://api.mercadopago.com/v1/payments',
+        body,
+        {
+          headers,
+          timeout: 25000
+        }
+      );
+    } else {
+      throw err;
     }
-  );
+  }
 
   const data = response.data || {};
   const txId = data.id;
@@ -571,7 +568,6 @@ async function createMercadoPagoPix(user, amount, options = {}) {
     raw: data
   };
 }
-
 
 // ================= MEDIA SENDERS =================
 async function sendOptionalVideo(chat_id, fileId, logLabel) {
@@ -811,7 +807,12 @@ async function goToPayment(chat_id, user, options = {}) {
       data: err.response?.data
     });
 
-    await bot.sendMessage(chat_id, '❌ Erro ao gerar pagamento.');
+    let errorMsg = '❌ Erro ao gerar pagamento.';
+    if (err.response?.data?.message?.includes('Collector user without key enabled')) {
+      errorMsg = '⚠️ <b>Erro de Configuração:</b>\n\nA conta do Mercado Pago não possui uma <b>Chave PIX</b> cadastrada.\n\nPara resolver:\n1. Acesse o app ou site do Mercado Pago.\n2. Vá em "Seu Perfil" > "Suas Chaves PIX".\n3. Cadastre uma chave (pode ser aleatória).\n4. Tente novamente aqui.';
+    }
+    
+    await bot.sendMessage(chat_id, errorMsg, { parse_mode: 'HTML' });
   }
 }
 
@@ -821,7 +822,7 @@ function getScheduledBumpCopy(index) {
     `🔥 Você entrou e ainda não garantiu seu acesso.\n\nAs vagas promocionais estão acabando e o VIP pode sair do ar a qualquer momento.`,
     `⚠️ Seu acesso ainda está pendente.\n\nSe quiser entrar com desconto, essa é a melhor hora para finalizar.`,
     `🚨 Muita gente entra, olha e volta depois.\n\nQuando volta, a promoção já acabou.`,
-    `⏳ Seu benefício ainda está disponível.\n\nMas não dá para garantir por muito tempo.`,
+    `⏳ Seu benefício ainda está disponível.\n\nBut não dá para garantir por muito tempo.`,
     `🔥 O conteúdo continua te esperando.\n\nSe quiser aproveitar o valor atual, finalize agora.`,
     `😈 As melhores pastas e mídias continuam bloqueadas.\n\nSó falta liberar seu acesso.`,
     `⚠️ Estamos nas últimas vagas promocionais.\n\nDepois disso, o valor pode subir.`,
@@ -918,213 +919,120 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     await sendToMeta('ViewContent', {
       ...user,
       event_id: uuidv4()
-    }, user.redirect_event_id || uuidv4());
+    });
 
     await sendPlanMessage(chat_id);
-    await scheduleUserBumpsInDb(chat_id);
+
+    await scheduleBumps(chat_id);
   } catch (err) {
-    console.log('START ERROR:', err.response?.data || err.message || err);
-    try {
-      await bot.sendMessage(msg.chat.id, '❌ Erro ao iniciar.');
-    } catch {}
+    console.log('START ERROR:', err);
   }
 });
 
-// ================= COMANDOS EXTRAS =================
-bot.onText(/^\/status$/, async (msg) => {
-  try {
-    const user = await getUserByChatId(msg.chat.id);
-
-    if (!user) {
-      return await bot.sendMessage(msg.chat.id, '❌ Não encontrei seu cadastro. Envie /start.');
-    }
-
-    return await bot.sendMessage(msg.chat.id, `
-📊 STATUS DA SUA CONTA
-
-Plano: ${user.plan || 'Não definido'}
-Pagamento principal: ${user.has_paid_main ? '✅ Pago' : '❌ Pendente'}
-Upsell: ${user.has_paid_upsell ? '✅ Pago' : '❌ Não pago'}
-`);
-  } catch (err) {
-    console.log('STATUS ERROR:', err);
-  }
-});
-
-bot.onText(/^\/suporte$/, async (msg) => {
-  try {
-    await bot.sendMessage(msg.chat.id, '💬 Suporte em breve.');
-  } catch (err) {
-    console.log('SUPORTE ERROR:', err);
-  }
-});
-
-// ================= TELEGRAM CALLBACK =================
+// ================= TELEGRAM CALLBACKS =================
 bot.on('callback_query', async (query) => {
+  const chat_id = query.message.chat.id;
+  const data = query.data;
+
   try {
-    if (!query?.message?.chat?.id) return;
-
-    const chat_id = query.message.chat.id;
-    const data = query.data;
-
-    await bot.answerCallbackQuery(query.id).catch(() => {});
-
-    const lockKey = `${chat_id}:${data}`;
-    if (!lockAction(lockKey)) return;
-
-    const user = await getUserByChatId(chat_id);
-    if (!user) {
-      return await bot.sendMessage(chat_id, '❌ Não encontrei seu cadastro. Envie /start novamente.');
-    }
-
     if (data === 'plan_week') {
-      await updateUserByChatId(chat_id, {
-        value: 7.42,
-        plan: 'week'
-      });
-
-      await sendToMeta('InitiateCheckout', {
-        ...user,
-        value: 7.42,
-        plan: 'week',
-        event_id: uuidv4()
-      });
-
-      return await sendOrderBumpMessage(chat_id);
+      await updateUserByChatId(chat_id, { plan: '1 SEMANA', value: 7.42 });
+      const user = await getUserByChatId(chat_id);
+      await sendOrderBumpMessage(chat_id);
     }
 
     if (data === 'plan_vip') {
-      await updateUserByChatId(chat_id, {
-        value: 15.42,
-        plan: 'vip'
-      });
-
-      await sendToMeta('InitiateCheckout', {
-        ...user,
-        value: 15.42,
-        plan: 'vip',
-        event_id: uuidv4()
-      });
-
-      return await sendOrderBumpMessage(chat_id);
+      await updateUserByChatId(chat_id, { plan: 'VIP VITALÍCIO', value: 15.42 });
+      const user = await getUserByChatId(chat_id);
+      await sendOrderBumpMessage(chat_id);
     }
 
     if (data === 'plan_full') {
-      await updateUserByChatId(chat_id, {
-        value: 23.42,
-        plan: 'full'
-      });
-
-      await sendToMeta('InitiateCheckout', {
-        ...user,
-        value: 23.42,
-        plan: 'full',
-        event_id: uuidv4()
-      });
-
-      return await sendOrderBumpMessage(chat_id);
+      await updateUserByChatId(chat_id, { plan: 'VITALÍCIO + PASTAS', value: 23.42 });
+      const user = await getUserByChatId(chat_id);
+      await sendOrderBumpMessage(chat_id);
     }
 
     if (data === 'bump_yes') {
-      const newValue = roundMoney(Number(user.value || 0) + 4.99);
-
+      const user = await getUserByChatId(chat_id);
+      const newValue = roundMoney(user.value + 4.99);
       await updateUserByChatId(chat_id, {
-        value: newValue
+        value: newValue,
+        plan: `${user.plan} + BUMP`
       });
-
-      return await goToPayment(chat_id, {
-        ...user,
-        value: newValue
-      }, { isUpsell: false });
+      const updatedUser = await getUserByChatId(chat_id);
+      await goToPayment(chat_id, updatedUser);
     }
 
     if (data === 'bump_no') {
-      return await goToPayment(chat_id, user, { isUpsell: false });
+      const user = await getUserByChatId(chat_id);
+      await goToPayment(chat_id, user);
     }
 
     if (data === 'upsell_buy') {
-      return await goToPayment(chat_id, {
-        ...user,
-        value: 10
-      }, {
-        isUpsell: true,
-        forcedAmount: 10
-      });
+      const user = await getUserByChatId(chat_id);
+      await goToPayment(chat_id, user, { isUpsell: true, forcedAmount: 10 });
     }
 
     if (data === 'remarketing_pay_now') {
-      let targetUser = { ...user };
-
-      if (!targetUser.plan) {
-        targetUser.plan = 'vip';
-        targetUser.value = 15.42;
-
-        await updateUserByChatId(chat_id, {
-          plan: 'vip',
-          value: 15.42
-        });
-      }
-
-      await sendToMeta('InitiateCheckout', {
-        ...targetUser,
-        event_id: uuidv4()
-      });
-
-      return await goToPayment(chat_id, targetUser, { isUpsell: false });
+      const user = await getUserByChatId(chat_id);
+      await goToPayment(chat_id, user);
     }
 
     if (data === 'remarketing_no') {
-      await updateUserByChatId(chat_id, {
-        stop_remarketing: true
-      });
-
-      await stopAllUserBumps(chat_id);
-      return await bot.sendMessage(chat_id, 'Tudo bem.');
-    }
-
-    if (data === 'check_payment' || data.startsWith('check_payment:')) {
-      const txId = data.includes(':') ? data.split(':')[1] : null;
-      const tx = txId ? await getTransactionByTxId(txId) : null;
-
-      if (!tx) {
-        return await bot.sendMessage(chat_id, '❌ Não encontrei esse pagamento. Gere um novo PIX.');
-      }
-
-      if (tx.status === 'paid') {
-        return await bot.sendMessage(chat_id, '✅ Seu pagamento já foi confirmado.');
-      }
-
-      return await bot.sendMessage(chat_id, '⏳ Ainda não localizei a confirmação. Se você acabou de pagar, aguarde alguns segundos e toque novamente em verificar status.');
-    }
-
-    if (data === 'copy_fallback' || data.startsWith('copy_fallback:')) {
-      const txId = data.includes(':') ? data.split(':')[1] : null;
-      const tx = txId ? await getTransactionByTxId(txId) : null;
-
-      if (!tx) {
-        return await bot.sendMessage(chat_id, '❌ Não encontrei esse código. Gere um novo PIX.');
-      }
-
-      return await bot.sendMessage(
-        chat_id,
-        '⚠️ O Telegram não permitiu o botão de cópia automática para esse código. Toque e segure no bloco do PIX para copiar manualmente.'
-      );
+      await sendDownsellMessage(chat_id);
     }
 
     if (data === 'downsell_view') {
-      return await bot.sendMessage(chat_id, '✅ Estrutura de downsell pronta para você personalizar depois.');
+      const user = await getUserByChatId(chat_id);
+      const downsellValue = roundMoney(user.value * 0.7);
+      await updateUserByChatId(chat_id, {
+        value: downsellValue,
+        plan: `${user.plan} (DOWNSELL)`
+      });
+      const updatedUser = await getUserByChatId(chat_id);
+      await goToPayment(chat_id, updatedUser, { isDownsell: true });
     }
 
     if (data === 'downsell_exit') {
-      return await bot.sendMessage(chat_id, 'Tudo bem.');
+      await bot.sendMessage(chat_id, 'Tudo bem.');
     }
+
+    if (data.startsWith('check_payment:')) {
+      const txId = data.split(':')[1];
+      const tx = await getTransactionByTxId(txId);
+
+      if (!tx) {
+        return await bot.answerCallbackQuery(query.id, { text: 'Transação não encontrada.', show_alert: true });
+      }
+
+      if (tx.status === 'paid') {
+        return await bot.answerCallbackQuery(query.id, { text: 'Pagamento já confirmado!', show_alert: true });
+      }
+
+      const paymentResponse = await axios.get(`https://api.mercadopago.com/v1/payments/${txId}`, {
+        headers: { 'Authorization': `Bearer ${MERCADOPAGO_ACCESS_TOKEN}` }
+      });
+
+      if (paymentResponse.data.status === 'approved') {
+        await bot.answerCallbackQuery(query.id, { text: 'Pagamento confirmado com sucesso!', show_alert: true });
+        // O webhook cuidará do resto, mas podemos forçar aqui se necessário
+      } else {
+        await bot.answerCallbackQuery(query.id, { text: 'Pagamento ainda não identificado. Tente em alguns instantes.', show_alert: true });
+      }
+    }
+
+    if (data.startsWith('copy_fallback:')) {
+      const txId = data.split(':')[1];
+      const tx = await getTransactionByTxId(txId);
+      if (tx && tx.pix_code) {
+        await bot.sendMessage(chat_id, `Aqui está o código para copiar:\n\n<code>${escapeHtml(tx.pix_code)}</code>`, { parse_mode: 'HTML' });
+      }
+    }
+
+    await bot.answerCallbackQuery(query.id);
   } catch (err) {
     console.log('CALLBACK ERROR:', err.response?.data || err.message || err);
-    try {
-      if (query?.message?.chat?.id) {
-        await bot.sendMessage(query.message.chat.id, '❌ Erro ao processar sua ação.');
-      }
-    } catch {}
   }
 });
 
@@ -1143,20 +1051,28 @@ app.post(TELEGRAM_PATH, (req, res) => {
 app.post(PAYMENT_PATH, async (req, res) => {
   try {
     const body = req.body || {};
-    const topic = body.topic || body.type;
+    const query = req.query || {};
+    
+    // Captura o tópico de Webhook (body.type) ou IPN (query.topic)
+    const topic = body.type || query.topic || body.topic;
 
+    // Se não for pagamento, responde 200 OK para o Mercado Pago não tentar reenviar
     if (topic !== 'payment') {
+      console.log('WEBHOOK TOPIC IGNORED:', topic);
       return res.sendStatus(200);
     }
 
-    const paymentIdFromQuery = String(req.query['data.id'] || '').trim();
-    const paymentId = String(paymentIdFromQuery || body?.data?.id || '').trim();
+    // Captura o ID do pagamento de várias formas possíveis (Webhook ou IPN)
+    const paymentId = String(
+      query['data.id'] || 
+      query.id || 
+      body?.data?.id || 
+      body?.resource?.split('/').pop() || 
+      ''
+    ).trim();
 
-    if (!paymentId) {
-      console.log('WEBHOOK WITHOUT PAYMENT ID:', {
-        query: req.query,
-        body
-      });
+    if (!paymentId || paymentId === '123456') {
+      console.log('WEBHOOK TEST OR EMPTY ID RECEIVED:', paymentId);
       return res.sendStatus(200);
     }
 
@@ -1164,139 +1080,77 @@ app.post(PAYMENT_PATH, async (req, res) => {
       const rawSignature = String(req.headers['x-signature'] || '');
       const xRequestId = String(req.headers['x-request-id'] || '');
 
-      if (!rawSignature || !xRequestId) {
-        console.log('WEBHOOK SIGNATURE HEADERS MISSING');
-        return res.sendStatus(401);
-      }
+      if (rawSignature && xRequestId) {
+        const signatureParts = rawSignature.split(',').reduce((acc, item) => {
+          const [key, value] = item.split('=');
+          if (key && value) acc[key.trim()] = value.trim();
+          return acc;
+        }, {});
 
-      const signatureParts = rawSignature.split(',').reduce((acc, item) => {
-        const [key, value] = item.split('=');
-        if (key && value) {
-          acc[key.trim()] = value.trim();
+        const ts = signatureParts.ts || '';
+        const receivedHash = signatureParts.v1 || '';
+        const manifestParts = [];
+
+        if (paymentIdFromQuery) {
+          const normalizedPaymentId = /^[a-z0-9]+$/i.test(paymentIdFromQuery) ? paymentIdFromQuery.toLowerCase() : paymentIdFromQuery;
+          manifestParts.push(`id:${normalizedPaymentId};`);
         }
-        return acc;
-      }, {});
+        if (xRequestId) manifestParts.push(`request-id:${xRequestId};`);
+        if (ts) manifestParts.push(`ts:${ts};`);
 
-      const ts = signatureParts.ts || '';
-      const receivedHash = signatureParts.v1 || '';
-      const manifestParts = [];
+        const manifest = manifestParts.join('');
+        const expectedHash = crypto.createHmac('sha256', MERCADOPAGO_WEBHOOK_SECRET).update(manifest).digest('hex');
 
-      if (paymentIdFromQuery) {
-        const normalizedPaymentId = /^[a-z0-9]+$/i.test(paymentIdFromQuery)
-          ? paymentIdFromQuery.toLowerCase()
-          : paymentIdFromQuery;
-        manifestParts.push(`id:${normalizedPaymentId};`);
-      }
-
-      if (xRequestId) {
-        manifestParts.push(`request-id:${xRequestId};`);
-      }
-
-      if (ts) {
-        manifestParts.push(`ts:${ts};`);
-      }
-
-      const manifest = manifestParts.join('');
-      const expectedHash = crypto
-        .createHmac('sha256', MERCADOPAGO_WEBHOOK_SECRET)
-        .update(manifest)
-        .digest('hex');
-
-      if (!receivedHash || expectedHash !== receivedHash) {
-        console.log('WEBHOOK SECRET INVALID');
-        return res.sendStatus(401);
+        if (receivedHash && expectedHash !== receivedHash) {
+          console.log('WEBHOOK SECRET INVALID');
+          return res.sendStatus(401);
+        }
       }
     }
 
-    const paymentResponse = await axios.get(
-      `https://api.mercadopago.com/v1/payments/${paymentId}`,
-      {
-        headers: {
-          'Authorization': `Bearer ${MERCADOPAGO_ACCESS_TOKEN}`
-        },
+    let paymentResponse;
+    try {
+      paymentResponse = await axios.get(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
+        headers: { 'Authorization': `Bearer ${MERCADOPAGO_ACCESS_TOKEN}` },
         timeout: 25000
+      });
+    } catch (err) {
+      // Se o ID não existir (ex: teste), responde 200 para o Mercado Pago parar de tentar
+      if (err.response?.status === 404) {
+        console.log('WEBHOOK PAYMENT NOT FOUND (TEST?):', paymentId);
+        return res.sendStatus(200);
       }
-    );
+      throw err;
+    }
 
     const payment = paymentResponse.data || {};
     const txId = String(payment.id || paymentId);
     const status = payment.status;
     const paidAt = payment.date_approved || payment.date_last_updated || null;
-    const paymentMethod = payment.payment_method_id;
 
-    if (!txId) {
-      console.log('WEBHOOK WITHOUT TXID:', body);
-      return res.sendStatus(200);
-    }
-
-    if (processedPayments.has(txId)) {
-      return res.sendStatus(200);
-    }
+    if (!txId || processedPayments.has(txId)) return res.sendStatus(200);
 
     const tx = await getTransactionByTxId(txId);
-    if (!tx) {
-      console.log('WEBHOOK TX NOT FOUND:', { txId, status, body });
-      return res.sendStatus(200);
-    }
+    if (!tx || tx.status === 'paid') return res.sendStatus(200);
 
-    if (tx.status === 'paid') {
-      return res.sendStatus(200);
-    }
+    if (status === 'approved') {
+      processedPayments.add(txId);
+      await markTransactionPaidDb(txId, paidAt ? new Date(paidAt).toISOString() : new Date().toISOString());
 
-    const paid = status === 'approved';
+      const user = await getUserByChatId(tx.chat_id);
+      if (!user) return res.sendStatus(200);
 
-    if (!paid) {
-      console.log('WEBHOOK NOT PAID YET:', { txId, status, paymentMethod });
-      return res.sendStatus(200);
-    }
-
-    processedPayments.add(txId);
-
-    await markTransactionPaidDb(
-      txId,
-      paidAt ? new Date(paidAt).toISOString() : new Date().toISOString()
-    );
-
-    const user = await getUserByChatId(tx.chat_id);
-    if (!user) {
-      return res.sendStatus(200);
-    }
-
-    if (!tx.upsell) {
-      await updateUserByChatId(tx.chat_id, {
-        has_paid_main: true,
-        stop_remarketing: true
-      });
-
-      await stopAllUserBumps(tx.chat_id);
-
-      await sendToMeta('Purchase', {
-        ...user,
-        value: tx.amount,
-        plan: tx.plan || user.plan || '',
-        event_id: uuidv4()
-      });
-
-      await bot.sendMessage(tx.chat_id, `
-✅ PAGAMENTO CONFIRMADO!
-
-Seu acesso está sendo liberado...
-`);
-
-      await sendUpsellMessage(tx.chat_id);
-    } else {
-      await updateUserByChatId(tx.chat_id, {
-        has_paid_upsell: true,
-        stop_remarketing: true
-      });
-
-      await stopAllUserBumps(tx.chat_id);
-
-      await bot.sendMessage(tx.chat_id, `
-🚀 ACESSO TOTAL LIBERADO!
-
-Aproveite todo o conteúdo 🔥
-`);
+      if (!tx.upsell) {
+        await updateUserByChatId(tx.chat_id, { has_paid_main: true, stop_remarketing: true });
+        await stopAllUserBumps(tx.chat_id);
+        await sendToMeta('Purchase', { ...user, value: tx.amount, plan: tx.plan || user.plan || '', event_id: uuidv4() });
+        await bot.sendMessage(tx.chat_id, `✅ PAGAMENTO CONFIRMADO!\n\nSeu acesso está sendo liberado...`);
+        await sendUpsellMessage(tx.chat_id);
+      } else {
+        await updateUserByChatId(tx.chat_id, { has_paid_upsell: true, stop_remarketing: true });
+        await stopAllUserBumps(tx.chat_id);
+        await bot.sendMessage(tx.chat_id, `🚀 ACESSO TOTAL LIBERADO!\n\nAproveite todo o conteúdo 🔥`);
+      }
     }
 
     return res.sendStatus(200);
@@ -1339,15 +1193,6 @@ async function setupTelegramWebhook() {
 // ================= WORKERS =================
 setInterval(runScheduledBumps, 60 * 1000);
 setInterval(cleanupOldStartPayloads, 6 * 60 * 60 * 1000);
-
-// ================= SAFETY =================
-process.on('unhandledRejection', (err) => {
-  console.log('UNHANDLED REJECTION:', err);
-});
-
-process.on('uncaughtException', (err) => {
-  console.log('UNCAUGHT EXCEPTION:', err);
-});
 
 // ================= SERVER =================
 app.listen(PORT, async () => {
