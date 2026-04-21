@@ -12,7 +12,7 @@ const TOKEN = process.env.BOT_TOKEN;
 const PORT = Number(process.env.PORT || 3000);
 const BASE_URL = (process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
 
-// ================= MERCADO PAGO ================
+// ================= MERCADO PAGO =================
 let MERCADOPAGO_ACCESS_TOKEN = process.env.MERCADOPAGO_ACCESS_TOKEN;
 const MERCADOPAGO_CLIENT_ID = process.env.MERCADOPAGO_CLIENT_ID;
 const MERCADOPAGO_CLIENT_SECRET = process.env.MERCADOPAGO_CLIENT_SECRET;
@@ -20,14 +20,14 @@ const MERCADOPAGO_WEBHOOK_SECRET = process.env.MERCADOPAGO_WEBHOOK_SECRET || '';
 
 async function refreshMercadoPagoToken() {
   if (!MERCADOPAGO_CLIENT_ID || !MERCADOPAGO_CLIENT_SECRET) return;
-  
+
   try {
     const response = await axios.post('https://api.mercadopago.com/oauth/token', {
       client_id: MERCADOPAGO_CLIENT_ID,
       client_secret: MERCADOPAGO_CLIENT_SECRET,
       grant_type: 'client_credentials'
     });
-    
+
     if (response.data && response.data.access_token) {
       MERCADOPAGO_ACCESS_TOKEN = response.data.access_token;
       console.log('MERCADOPAGO TOKEN REFRESHED');
@@ -105,7 +105,7 @@ const app = express();
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'x-signature']
+  allowedHeaders: ['Content-Type', 'x-signature', 'x-request-id']
 }));
 
 app.use(bodyParser.json({
@@ -128,14 +128,6 @@ function nowSec() {
 
 function roundMoney(value) {
   return Number(Number(value || 0).toFixed(2));
-}
-
-function toCents(value) {
-  return Math.round(Number(value || 0) * 100);
-}
-
-function centsToMoney(cents) {
-  return roundMoney(Number(cents || 0) / 100);
 }
 
 function formatBRL(value) {
@@ -163,7 +155,7 @@ function lockAction(key, ttlMs = 5000) {
 function sha256(value) {
   return crypto
     .createHash('sha256')
-    .update(String(value).trim().toLowerCase())
+    .update(String(value || '').trim().toLowerCase())
     .digest('hex');
 }
 
@@ -215,6 +207,14 @@ function buildUserRecord(chat_id, payload = {}) {
     has_paid_upsell: false,
     stop_remarketing: false
   };
+}
+
+async function safeAnswerCallback(queryId, options = {}) {
+  try {
+    await bot.answerCallbackQuery(queryId, options);
+  } catch (err) {
+    console.log('ANSWER CALLBACK ERROR:', err.response?.data || err.message || err);
+  }
 }
 
 // ================= SUPABASE: USERS =================
@@ -454,7 +454,7 @@ async function sendToMeta(eventName, user, customData = {}) {
           }
         }
       ],
-      test_event_code: META_TEST_EVENT_CODE
+      test_event_code: META_TEST_EVENT_CODE || undefined
     };
 
     await axios.post(
@@ -468,7 +468,7 @@ async function sendToMeta(eventName, user, customData = {}) {
   }
 }
 
-// ================= MERCADO PAGO ================
+// ================= MERCADO PAGO =================
 async function createMercadoPagoPix(user, amount, options = {}) {
   const {
     isUpsell = false,
@@ -531,7 +531,7 @@ async function createMercadoPagoPix(user, amount, options = {}) {
       }
     );
   } catch (err) {
-    if (err.response?.status === 401 && (MERCADOPAGO_CLIENT_ID && MERCADOPAGO_CLIENT_SECRET)) {
+    if (err.response?.status === 401 && MERCADOPAGO_CLIENT_ID && MERCADOPAGO_CLIENT_SECRET) {
       await refreshMercadoPagoToken();
       headers.Authorization = `Bearer ${MERCADOPAGO_ACCESS_TOKEN}`;
       response = await axios.post(
@@ -548,9 +548,9 @@ async function createMercadoPagoPix(user, amount, options = {}) {
   }
 
   const data = response.data || {};
-  const txId = data.id;
-  const pixCode = data.point_of_interaction?.transaction_data?.qr_code;
-  const qrCodeImage = data.point_of_interaction?.transaction_data?.qr_code_base64;
+  const txId = String(data.id || '').trim();
+  const pixCode = data.point_of_interaction?.transaction_data?.qr_code || '';
+  const qrCodeImage = data.point_of_interaction?.transaction_data?.qr_code_base64 || '';
 
   if (!txId) {
     throw new Error(`Resposta Mercado Pago sem ID da transação: ${JSON.stringify(data)}`);
@@ -811,7 +811,7 @@ async function goToPayment(chat_id, user, options = {}) {
     if (err.response?.data?.message?.includes('Collector user without key enabled')) {
       errorMsg = '⚠️ <b>Erro de Configuração:</b>\n\nA conta do Mercado Pago não possui uma <b>Chave PIX</b> cadastrada.\n\nPara resolver:\n1. Acesse o app ou site do Mercado Pago.\n2. Vá em "Seu Perfil" > "Suas Chaves PIX".\n3. Cadastre uma chave (pode ser aleatória).\n4. Tente novamente aqui.';
     }
-    
+
     await bot.sendMessage(chat_id, errorMsg, { parse_mode: 'HTML' });
   }
 }
@@ -822,7 +822,7 @@ function getScheduledBumpCopy(index) {
     `🔥 Você entrou e ainda não garantiu seu acesso.\n\nAs vagas promocionais estão acabando e o VIP pode sair do ar a qualquer momento.`,
     `⚠️ Seu acesso ainda está pendente.\n\nSe quiser entrar com desconto, essa é a melhor hora para finalizar.`,
     `🚨 Muita gente entra, olha e volta depois.\n\nQuando volta, a promoção já acabou.`,
-    `⏳ Seu benefício ainda está disponível.\n\nBut não dá para garantir por muito tempo.`,
+    `⏳ Seu benefício ainda está disponível.\n\nMas não dá para garantir por muito tempo.`,
     `🔥 O conteúdo continua te esperando.\n\nSe quiser aproveitar o valor atual, finalize agora.`,
     `😈 As melhores pastas e mídias continuam bloqueadas.\n\nSó falta liberar seu acesso.`,
     `⚠️ Estamos nas últimas vagas promocionais.\n\nDepois disso, o valor pode subir.`,
@@ -921,11 +921,11 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
       event_id: uuidv4()
     });
 
+    await stopAllUserBumps(chat_id).catch(() => {});
     await sendPlanMessage(chat_id);
-
     await scheduleBumps(chat_id);
   } catch (err) {
-    console.log('START ERROR:', err);
+    console.log('START ERROR:', err.response?.data || err.message || err);
   }
 });
 
@@ -935,67 +935,82 @@ bot.on('callback_query', async (query) => {
   const data = query.data;
 
   try {
+    if (!lockAction(`cb_${chat_id}_${data}`, 1500)) {
+      return await safeAnswerCallback(query.id, { text: 'Aguarde um instante...' });
+    }
+
     if (data === 'plan_week') {
       await updateUserByChatId(chat_id, { plan: '1 SEMANA', value: 7.42 });
-      const user = await getUserByChatId(chat_id);
       await sendOrderBumpMessage(chat_id);
+      return await safeAnswerCallback(query.id);
     }
 
     if (data === 'plan_vip') {
       await updateUserByChatId(chat_id, { plan: 'VIP VITALÍCIO', value: 15.42 });
-      const user = await getUserByChatId(chat_id);
       await sendOrderBumpMessage(chat_id);
+      return await safeAnswerCallback(query.id);
     }
 
     if (data === 'plan_full') {
       await updateUserByChatId(chat_id, { plan: 'VITALÍCIO + PASTAS', value: 23.42 });
-      const user = await getUserByChatId(chat_id);
       await sendOrderBumpMessage(chat_id);
+      return await safeAnswerCallback(query.id);
     }
 
     if (data === 'bump_yes') {
       const user = await getUserByChatId(chat_id);
-      const newValue = roundMoney(user.value + 4.99);
+      const newValue = roundMoney((user?.value || 0) + 4.99);
+
       await updateUserByChatId(chat_id, {
         value: newValue,
         plan: `${user.plan} + BUMP`
       });
+
       const updatedUser = await getUserByChatId(chat_id);
       await goToPayment(chat_id, updatedUser);
+      return await safeAnswerCallback(query.id);
     }
 
     if (data === 'bump_no') {
       const user = await getUserByChatId(chat_id);
       await goToPayment(chat_id, user);
+      return await safeAnswerCallback(query.id);
     }
 
     if (data === 'upsell_buy') {
       const user = await getUserByChatId(chat_id);
       await goToPayment(chat_id, user, { isUpsell: true, forcedAmount: 10 });
+      return await safeAnswerCallback(query.id);
     }
 
     if (data === 'remarketing_pay_now') {
       const user = await getUserByChatId(chat_id);
       await goToPayment(chat_id, user);
+      return await safeAnswerCallback(query.id);
     }
 
     if (data === 'remarketing_no') {
       await sendDownsellMessage(chat_id);
+      return await safeAnswerCallback(query.id);
     }
 
     if (data === 'downsell_view') {
       const user = await getUserByChatId(chat_id);
-      const downsellValue = roundMoney(user.value * 0.7);
+      const downsellValue = roundMoney((user?.value || 0) * 0.7);
+
       await updateUserByChatId(chat_id, {
         value: downsellValue,
         plan: `${user.plan} (DOWNSELL)`
       });
+
       const updatedUser = await getUserByChatId(chat_id);
       await goToPayment(chat_id, updatedUser, { isDownsell: true });
+      return await safeAnswerCallback(query.id);
     }
 
     if (data === 'downsell_exit') {
       await bot.sendMessage(chat_id, 'Tudo bem.');
+      return await safeAnswerCallback(query.id);
     }
 
     if (data.startsWith('check_payment:')) {
@@ -1003,36 +1018,59 @@ bot.on('callback_query', async (query) => {
       const tx = await getTransactionByTxId(txId);
 
       if (!tx) {
-        return await bot.answerCallbackQuery(query.id, { text: 'Transação não encontrada.', show_alert: true });
+        return await safeAnswerCallback(query.id, {
+          text: 'Transação não encontrada.',
+          show_alert: true
+        });
       }
 
       if (tx.status === 'paid') {
-        return await bot.answerCallbackQuery(query.id, { text: 'Pagamento já confirmado!', show_alert: true });
+        return await safeAnswerCallback(query.id, {
+          text: 'Pagamento já confirmado!',
+          show_alert: true
+        });
       }
 
       const paymentResponse = await axios.get(`https://api.mercadopago.com/v1/payments/${txId}`, {
-        headers: { 'Authorization': `Bearer ${MERCADOPAGO_ACCESS_TOKEN}` }
+        headers: { Authorization: `Bearer ${MERCADOPAGO_ACCESS_TOKEN}` },
+        timeout: 15000
       });
 
       if (paymentResponse.data.status === 'approved') {
-        await bot.answerCallbackQuery(query.id, { text: 'Pagamento confirmado com sucesso!', show_alert: true });
-        // O webhook cuidará do resto, mas podemos forçar aqui se necessário
-      } else {
-        await bot.answerCallbackQuery(query.id, { text: 'Pagamento ainda não identificado. Tente em alguns instantes.', show_alert: true });
+        return await safeAnswerCallback(query.id, {
+          text: 'Pagamento confirmado com sucesso!',
+          show_alert: true
+        });
       }
+
+      return await safeAnswerCallback(query.id, {
+        text: 'Pagamento ainda não identificado. Tente em alguns instantes.',
+        show_alert: true
+      });
     }
 
     if (data.startsWith('copy_fallback:')) {
       const txId = data.split(':')[1];
       const tx = await getTransactionByTxId(txId);
+
       if (tx && tx.pix_code) {
-        await bot.sendMessage(chat_id, `Aqui está o código para copiar:\n\n<code>${escapeHtml(tx.pix_code)}</code>`, { parse_mode: 'HTML' });
+        await bot.sendMessage(
+          chat_id,
+          `Aqui está o código para copiar:\n\n<code>${escapeHtml(tx.pix_code)}</code>`,
+          { parse_mode: 'HTML' }
+        );
       }
+
+      return await safeAnswerCallback(query.id, { text: 'Código enviado.' });
     }
 
-    await bot.answerCallbackQuery(query.id);
+    return await safeAnswerCallback(query.id);
   } catch (err) {
     console.log('CALLBACK ERROR:', err.response?.data || err.message || err);
+    return await safeAnswerCallback(query.id, {
+      text: 'Ocorreu um erro. Tente novamente.',
+      show_alert: true
+    });
   }
 });
 
@@ -1040,10 +1078,10 @@ bot.on('callback_query', async (query) => {
 app.post(TELEGRAM_PATH, (req, res) => {
   try {
     bot.processUpdate(req.body);
-    res.sendStatus(200);
+    return res.sendStatus(200);
   } catch (err) {
     console.log('TELEGRAM ROUTE ERROR:', err);
-    res.sendStatus(200);
+    return res.sendStatus(200);
   }
 });
 
@@ -1052,22 +1090,19 @@ app.post(PAYMENT_PATH, async (req, res) => {
   try {
     const body = req.body || {};
     const query = req.query || {};
-    
-    // Captura o tópico de Webhook (body.type) ou IPN (query.topic)
+
     const topic = body.type || query.topic || body.topic;
 
-    // Se não for pagamento, responde 200 OK para o Mercado Pago não tentar reenviar
     if (topic !== 'payment') {
       console.log('WEBHOOK TOPIC IGNORED:', topic);
       return res.sendStatus(200);
     }
 
-    // Captura o ID do pagamento de várias formas possíveis (Webhook ou IPN)
     const paymentId = String(
-      query['data.id'] || 
-      query.id || 
-      body?.data?.id || 
-      body?.resource?.split('/').pop() || 
+      query['data.id'] ||
+      query.id ||
+      body?.data?.id ||
+      body?.resource?.split('/').pop() ||
       ''
     ).trim();
 
@@ -1091,15 +1126,21 @@ app.post(PAYMENT_PATH, async (req, res) => {
         const receivedHash = signatureParts.v1 || '';
         const manifestParts = [];
 
-        if (paymentIdFromQuery) {
-          const normalizedPaymentId = /^[a-z0-9]+$/i.test(paymentIdFromQuery) ? paymentIdFromQuery.toLowerCase() : paymentIdFromQuery;
+        if (paymentId) {
+          const normalizedPaymentId = /^[a-z0-9]+$/i.test(paymentId)
+            ? paymentId.toLowerCase()
+            : paymentId;
           manifestParts.push(`id:${normalizedPaymentId};`);
         }
+
         if (xRequestId) manifestParts.push(`request-id:${xRequestId};`);
         if (ts) manifestParts.push(`ts:${ts};`);
 
         const manifest = manifestParts.join('');
-        const expectedHash = crypto.createHmac('sha256', MERCADOPAGO_WEBHOOK_SECRET).update(manifest).digest('hex');
+        const expectedHash = crypto
+          .createHmac('sha256', MERCADOPAGO_WEBHOOK_SECRET)
+          .update(manifest)
+          .digest('hex');
 
         if (receivedHash && expectedHash !== receivedHash) {
           console.log('WEBHOOK SECRET INVALID');
@@ -1111,11 +1152,10 @@ app.post(PAYMENT_PATH, async (req, res) => {
     let paymentResponse;
     try {
       paymentResponse = await axios.get(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
-        headers: { 'Authorization': `Bearer ${MERCADOPAGO_ACCESS_TOKEN}` },
+        headers: { Authorization: `Bearer ${MERCADOPAGO_ACCESS_TOKEN}` },
         timeout: 25000
       });
     } catch (err) {
-      // Se o ID não existir (ex: teste), responde 200 para o Mercado Pago parar de tentar
       if (err.response?.status === 404) {
         console.log('WEBHOOK PAYMENT NOT FOUND (TEST?):', paymentId);
         return res.sendStatus(200);
@@ -1128,26 +1168,51 @@ app.post(PAYMENT_PATH, async (req, res) => {
     const status = payment.status;
     const paidAt = payment.date_approved || payment.date_last_updated || null;
 
-    if (!txId || processedPayments.has(txId)) return res.sendStatus(200);
+    if (!txId || processedPayments.has(txId)) {
+      return res.sendStatus(200);
+    }
 
     const tx = await getTransactionByTxId(txId);
-    if (!tx || tx.status === 'paid') return res.sendStatus(200);
+    if (!tx || tx.status === 'paid') {
+      return res.sendStatus(200);
+    }
 
     if (status === 'approved') {
       processedPayments.add(txId);
-      await markTransactionPaidDb(txId, paidAt ? new Date(paidAt).toISOString() : new Date().toISOString());
+
+      await markTransactionPaidDb(
+        txId,
+        paidAt ? new Date(paidAt).toISOString() : new Date().toISOString()
+      );
 
       const user = await getUserByChatId(tx.chat_id);
-      if (!user) return res.sendStatus(200);
+      if (!user) {
+        return res.sendStatus(200);
+      }
 
       if (!tx.upsell) {
-        await updateUserByChatId(tx.chat_id, { has_paid_main: true, stop_remarketing: true });
+        await updateUserByChatId(tx.chat_id, {
+          has_paid_main: true,
+          stop_remarketing: true
+        });
+
         await stopAllUserBumps(tx.chat_id);
-        await sendToMeta('Purchase', { ...user, value: tx.amount, plan: tx.plan || user.plan || '', event_id: uuidv4() });
+
+        await sendToMeta('Purchase', {
+          ...user,
+          value: tx.amount,
+          plan: tx.plan || user.plan || '',
+          event_id: uuidv4()
+        });
+
         await bot.sendMessage(tx.chat_id, `✅ PAGAMENTO CONFIRMADO!\n\nSeu acesso está sendo liberado...`);
         await sendUpsellMessage(tx.chat_id);
       } else {
-        await updateUserByChatId(tx.chat_id, { has_paid_upsell: true, stop_remarketing: true });
+        await updateUserByChatId(tx.chat_id, {
+          has_paid_upsell: true,
+          stop_remarketing: true
+        });
+
         await stopAllUserBumps(tx.chat_id);
         await bot.sendMessage(tx.chat_id, `🚀 ACESSO TOTAL LIBERADO!\n\nAproveite todo o conteúdo 🔥`);
       }
