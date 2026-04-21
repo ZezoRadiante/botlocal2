@@ -162,7 +162,7 @@ async function confirmApprovedTransaction(tx, paidAt = null, source = 'unknown')
     await stopAllUserBumps(tx.chat_id);
     try { await sendToMeta('Purchase', { ...user, value: tx.amount, plan: tx.plan || user.plan || '', event_id: `purchase_${tx.tx_id}` }); await markTransactionMetaSent(tx.tx_id); } catch (err) {}
     await safeSendMessage(tx.chat_id, `✅ PAGAMENTO CONFIRMADO!\n\nSeu acesso está sendo liberado...`);
-    await sendUpsellMessage(chat_id);
+    await sendUpsellMessage(tx.chat_id);
   } else {
     await updateUserByChatId(tx.chat_id, { has_paid_upsell: true, stop_remarketing: true });
     await stopAllUserBumps(tx.chat_id);
@@ -231,6 +231,9 @@ async function sendPlanMessage(chat_id) {
 }
 
 async function sendOrderBumpMessage(chat_id) {
+  // Enviar vídeo do order bump antes da mensagem
+  await safeSendVideo(chat_id, VIDEO_BUMP);
+
   const text = `
 🚫 <b>LIVES BANIDAS 🔥</b>
 
