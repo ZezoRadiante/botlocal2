@@ -98,6 +98,7 @@ if (!SUPABASE_SERVICE_ROLE_KEY) throw new Error('SUPABASE_SERVICE_ROLE_KEY não 
 const TELEGRAM_PATH = '/telegram';
 const PAYMENT_PATH = '/webhook';
 const TELEGRAM_WEBHOOK_URL = `${BASE_URL}${TELEGRAM_PATH}`;
+const ACCESS_URL = 'https://t.me/suporterayssabot';
 
 const bot = new TelegramBot(TOKEN, { webHook: true });
 const app = express();
@@ -215,6 +216,16 @@ async function safeAnswerCallback(queryId, options = {}) {
   } catch (err) {
     console.log('ANSWER CALLBACK ERROR:', err.response?.data || err.message || err);
   }
+}
+
+async function sendAccessReleasedMessage(chat_id, text) {
+  return bot.sendMessage(chat_id, text, {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '🔒 Acessar conteúdo', url: ACCESS_URL }]
+      ]
+    }
+  });
 }
 
 // ================= SUPABASE: USERS =================
@@ -491,11 +502,7 @@ async function createMercadoPagoPix(user, amount, options = {}) {
 
   const body = {
     transaction_amount: amount,
-    description: isUpsell
-      ? 'Tarifa de Segurança'
-      : isDownsell
-        ? 'Oferta Especial'
-        : 'Acesso VIP',
+    description: isDownsell ? 'Oferta Especial' : 'Acesso VIP',
     payment_method_id: 'pix',
     payer: {
       email: customer.email,
@@ -508,7 +515,7 @@ async function createMercadoPagoPix(user, amount, options = {}) {
     notification_url: `${BASE_URL}${PAYMENT_PATH}`,
     metadata: {
       chat_id: user.chat_id,
-      isUpsell: isUpsell,
+      isUpsell: false,
       isDownsell: isDownsell,
       plan: user.plan || ''
     }
@@ -669,24 +676,6 @@ async function sendOrderBumpMessage(chat_id) {
   });
 }
 
-async function sendUpsellMessage(chat_id) {
-  return bot.sendMessage(chat_id, `
-🔒 Tarifa de Segurança – Verificação Obrigatória
-
-Nós prezamos pela segurança dos membros.
-
-💳 R$10 (100% reembolsável)
-
-⚠️ Caso não pague, o acesso pode ser bloqueado.
-`, {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: '🟢 PAGAR TARIFA R$10', callback_data: 'upsell_buy' }]
-      ]
-    }
-  });
-}
-
 async function sendDownsellMessage(chat_id) {
   await sendDownsellMedia(chat_id);
 
@@ -789,7 +778,7 @@ async function goToPayment(chat_id, user, options = {}) {
       txId,
       chat_id,
       amount,
-      upsell: isUpsell,
+      upsell: false,
       downsell: isDownsell,
       pixCode,
       plan: user.plan || '',
@@ -974,12 +963,6 @@ bot.on('callback_query', async (query) => {
     if (data === 'bump_no') {
       const user = await getUserByChatId(chat_id);
       await goToPayment(chat_id, user);
-      return await safeAnswerCallback(query.id);
-    }
-
-    if (data === 'upsell_buy') {
-      const user = await getUserByChatId(chat_id);
-      await goToPayment(chat_id, user, { isUpsell: true, forcedAmount: 10 });
       return await safeAnswerCallback(query.id);
     }
 
@@ -1205,8 +1188,10 @@ app.post(PAYMENT_PATH, async (req, res) => {
           event_id: uuidv4()
         });
 
-        await bot.sendMessage(tx.chat_id, `✅ PAGAMENTO CONFIRMADO!\n\nSeu acesso está sendo liberado...`);
-        await sendUpsellMessage(tx.chat_id);
+        await sendAccessReleasedMessage(
+          tx.chat_id,
+          `✅ PAGAMENTO CONFIRMADO!\n\nSeu acesso foi liberado com sucesso 🔥\n\nToque no botão abaixo para entrar agora mesmo:`
+        );
       } else {
         await updateUserByChatId(tx.chat_id, {
           has_paid_upsell: true,
@@ -1214,7 +1199,11 @@ app.post(PAYMENT_PATH, async (req, res) => {
         });
 
         await stopAllUserBumps(tx.chat_id);
-        await bot.sendMessage(tx.chat_id, `🚀 ACESSO TOTAL LIBERADO!\n\nAproveite todo o conteúdo 🔥`);
+
+        await sendAccessReleasedMessage(
+          tx.chat_id,
+          `🚀 ACESSO TOTAL LIBERADO!\n\nToque no botão abaixo para acessar seu conteúdo agora mesmo.`
+        );
       }
     }
 
