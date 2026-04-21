@@ -6,16 +6,17 @@ const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
+const { MercadoPagoConfig, Payment } = require('mercadopago');
 
 // ================= CONFIG =================
 const TOKEN = process.env.BOT_TOKEN;
 const PORT = Number(process.env.PORT || 3000);
 const BASE_URL = (process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
 
-// ================= TRIBOPAY =================
-const TRIBOPAY_BASE_URL = (process.env.TRIBOPAY_BASE_URL || 'https://api.tribopay.com.br/api').replace(/\/+$/, '');
-const TRIBOPAY_API_TOKEN = process.env.TRIBOPAY_API_TOKEN;
-const TRIBOPAY_OFFER_HASH = process.env.TRIBOPAY_OFFER_HASH;
+// ================= MERCADO PAGO =================
+const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+const mpClient = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN });
+const mpPayment = new Payment(mpClient);
 
 // ================= META =================
 const META_PIXEL_ID = process.env.META_PIXEL_ID || '1505014021315132';
@@ -67,8 +68,7 @@ const ORDER_BUMP_SCHEDULES = [
 // ================= VALIDATION =================
 if (!TOKEN) throw new Error('BOT_TOKEN não configurado');
 if (!BASE_URL) throw new Error('RENDER_EXTERNAL_URL não configurado');
-if (!TRIBOPAY_API_TOKEN) throw new Error('TRIBOPAY_API_TOKEN não configurado');
-if (!TRIBOPAY_OFFER_HASH) throw new Error('TRIBOPAY_OFFER_HASH não configurado');
+if (!MP_ACCESS_TOKEN) throw new Error('MP_ACCESS_TOKEN não configurado');
 if (!META_TOKEN) throw new Error('META_TOKEN não configurado');
 if (!SUPABASE_URL) throw new Error('SUPABASE_URL não configurado');
 if (!SUPABASE_SERVICE_ROLE_KEY) throw new Error('SUPABASE_SERVICE_ROLE_KEY não configurado');
@@ -143,10 +143,6 @@ function sha256(value) {
     .digest('hex');
 }
 
-function generateShortStartToken() {
-  return crypto.randomBytes(24).toString('base64url');
-}
-
 function buildFallbackCustomer(chat_id) {
   const domain = String(DEFAULT_CUSTOMER_EMAIL_DOMAIN || 'gmail.com')
     .replace(/^@+/, '')
@@ -160,229 +156,11 @@ function buildFallbackCustomer(chat_id) {
   };
 }
 
-function extractTriboPixCode(data) {
-  return (
-    data?.pix?.pix_qr_code ||
-    data?.pix_code ||
-    data?.pixCode ||
-    data?.pix?.payload ||
-    data?.pix?.code ||
-    data?.qr_code ||
-    data?.qrCode ||
-    data?.copy_paste ||
-    data?.copyAndPaste ||
-    data?.payment_data?.pix_code ||
-    data?.data?.pix?.pix_qr_code ||
-    data?.data?.pix_code ||
-    null
-  );
-}
-
-function extractTriboQrCodeImage(data) {
-  return (
-    data?.pix?.qr_code_base64 ||
-    data?.qr_code_base64 ||
-    data?.payment_data?.qr_code_base64 ||
-    data?.data?.pix?.qr_code_base64 ||
-    data?.data?.qr_code_base64 ||
-    null
-  );
-}
-
-function extractTriboTransactionHash(data) {
-  return (
-    data?.hash ||
-    data?.transaction_hash ||
-    data?.data?.hash ||
-    data?.data?.transaction_hash ||
-    null
-  );
-}
-
-function extractTriboStatus(data) {
-  return (
-    data?.payment_status ||
-    data?.status ||
-    data?.data?.payment_status ||
-    data?.data?.status ||
-    ''
-  );
-}
-
-function extractTriboPaidAt(data) {
-  return (
-    data?.paid_at ||
-    data?.data?.paid_at ||
-    null
-  );
-}
-
-function buildUserRecord(chat_id, payload = {}) {
-  const fallbackCustomer = buildFallbackCustomer(chat_id);
-
-  return {
-    chat_id,
-    fbc: payload.fbc || '',
-    fbp: payload.fbp || '',
-    ip: payload.ip || '',
-    ua: payload.ua || '',
-    lang: payload.lang || '',
-    screen: payload.screen || '',
-    tz: payload.tz || '',
-    referrer: payload.referrer || '',
-    host: payload.host || '',
-    path: payload.path || '',
-    utm_source: payload.utm_source || '',
-    utm_medium: payload.utm_medium || '',
-    utm_campaign: payload.utm_campaign || '',
-    utm_content: payload.utm_content || '',
-    utm_term: payload.utm_term || '',
-    utm_ad: payload.utm_ad || '',
-    campaign_id: payload.campaign_id || '',
-    adset_id: payload.adset_id || '',
-    ad_id: payload.ad_id || '',
-    redirect_event_id: payload.redirect_event_id || '',
-    customer_name: payload.customer_name || fallbackCustomer.name,
-    customer_email: payload.customer_email || fallbackCustomer.email,
-    customer_phone: onlyDigits(payload.customer_phone || fallbackCustomer.phone_number),
-    customer_document: onlyDigits(payload.customer_document || fallbackCustomer.document),
-    plan: '',
-    value: 0,
-    has_paid_main: false,
-    has_paid_upsell: false,
-    stop_remarketing: false
-  };
-}
-
-// ================= TELEGRAM ERROR HELPERS =================
-function getTelegramErrorCode(err) {
-  return (
-    err?.response?.body?.error_code ||
-    err?.response?.statusCode ||
-    err?.response?.status ||
-    err?.code ||
-    null
-  );
-}
-
-function getTelegramErrorDescription(err) {
-  return String(
-    err?.response?.body?.description ||
-    err?.response?.data?.description ||
-    err?.message ||
-    ''
-  ).toLowerCase();
-}
-
-function isTelegramBlockedError(err) {
-  const code = getTelegramErrorCode(err);
-  const description = getTelegramErrorDescription(err);
-
-  return (
-    code === 403 &&
-    (
-      description.includes('bot was blocked by the user') ||
-      description.includes('forbidden: bot was blocked by the user') ||
-      description.includes('user is deactivated') ||
-      description.includes('chat not found')
-    )
-  );
-}
-
-function isIgnorableTelegramError(err) {
-  return isTelegramBlockedError(err);
-}
-
-function logTelegramError(label, err) {
-  if (isIgnorableTelegramError(err)) {
-    console.log(`${label} IGNORADO: usuário bloqueou o bot ou chat indisponível`);
-    return;
-  }
-
-  console.log(`${label} ERROR:`, err?.response?.data || err?.response?.body || err?.message || err);
-}
-
-// ================= SAFE TELEGRAM SENDERS =================
-async function safeSendMessage(chat_id, text, options = {}, label = 'SEND MESSAGE') {
-  try {
-    await bot.sendMessage(chat_id, text, options);
-    return true;
-  } catch (err) {
-    logTelegramError(label, err);
-    return false;
-  }
-}
-
-async function safeSendVideo(chat_id, fileId, options = {}, label = 'SEND VIDEO') {
-  try {
-    await bot.sendVideo(chat_id, fileId, options);
-    return true;
-  } catch (err) {
-    logTelegramError(label, err);
-    return false;
-  }
-}
-
-async function safeSendPhoto(chat_id, fileId, options = {}, label = 'SEND PHOTO') {
-  try {
-    await bot.sendPhoto(chat_id, fileId, options);
-    return true;
-  } catch (err) {
-    logTelegramError(label, err);
-    return false;
-  }
-}
-
-async function safeSendDocument(chat_id, fileId, options = {}, label = 'SEND DOCUMENT') {
-  try {
-    await bot.sendDocument(chat_id, fileId, options);
-    return true;
-  } catch (err) {
-    logTelegramError(label, err);
-    return false;
-  }
-}
-
-// ================= SUPABASE: USERS =================
+// ================= SUPABASE DB OPS =================
 async function upsertUser(user) {
-  const payload = {
-    chat_id: user.chat_id,
-    fbc: user.fbc || '',
-    fbp: user.fbp || '',
-    ip: user.ip || '',
-    ua: user.ua || '',
-    lang: user.lang || '',
-    screen: user.screen || '',
-    tz: user.tz || '',
-    referrer: user.referrer || '',
-    host: user.host || '',
-    path: user.path || '',
-    utm_source: user.utm_source || '',
-    utm_medium: user.utm_medium || '',
-    utm_campaign: user.utm_campaign || '',
-    utm_content: user.utm_content || '',
-    utm_term: user.utm_term || '',
-    utm_ad: user.utm_ad || '',
-    campaign_id: user.campaign_id || '',
-    adset_id: user.adset_id || '',
-    ad_id: user.ad_id || '',
-    redirect_event_id: user.redirect_event_id || '',
-    customer_name: user.customer_name || '',
-    customer_email: user.customer_email || '',
-    customer_phone: user.customer_phone || '',
-    customer_document: user.customer_document || '',
-    plan: user.plan || '',
-    value: Number(user.value || 0),
-    has_paid_main: !!user.has_paid_main,
-    has_paid_upsell: !!user.has_paid_upsell,
-    stop_remarketing: !!user.stop_remarketing,
-    updated_at: new Date().toISOString()
-  };
-
   const { error } = await supabase
     .from('users')
-    .upsert(payload, { onConflict: 'chat_id' });
-
+    .upsert(user, { onConflict: 'chat_id' });
   if (error) throw error;
 }
 
@@ -392,7 +170,6 @@ async function getUserByChatId(chat_id) {
     .select('*')
     .eq('chat_id', chat_id)
     .maybeSingle();
-
   if (error) throw error;
   return data;
 }
@@ -400,37 +177,15 @@ async function getUserByChatId(chat_id) {
 async function updateUserByChatId(chat_id, updates) {
   const { error } = await supabase
     .from('users')
-    .update({
-      ...updates,
-      updated_at: new Date().toISOString()
-    })
+    .update(updates)
     .eq('chat_id', chat_id);
-
   if (error) throw error;
 }
 
-// ================= SUPABASE: TRANSACTIONS =================
 async function createOrUpdateTransaction(tx) {
-  const payload = {
-    tx_id: tx.txId,
-    chat_id: tx.chat_id,
-    amount: Number(tx.amount),
-    status: tx.status || 'pending',
-    upsell: !!tx.upsell,
-    downsell: !!tx.downsell,
-    pix_code: tx.pixCode || '',
-    plan: tx.plan || '',
-    meta_purchase_sent: !!tx.meta_purchase_sent,
-    gateway: 'tribopay',
-    payment_method: tx.payment_method || 'pix',
-    gateway_paid_at: tx.gateway_paid_at || null,
-    updated_at: new Date().toISOString()
-  };
-
   const { error } = await supabase
     .from('transactions')
-    .upsert(payload, { onConflict: 'tx_id' });
-
+    .upsert(tx, { onConflict: 'tx_id' });
   if (error) throw error;
 }
 
@@ -440,64 +195,46 @@ async function getTransactionByTxId(txId) {
     .select('*')
     .eq('tx_id', txId)
     .maybeSingle();
-
   if (error) throw error;
   return data;
 }
 
-async function markTransactionPaidDb(txId, paidAt = null) {
+async function markTransactionPaidDb(txId, paidAt) {
   const { error } = await supabase
     .from('transactions')
     .update({
       status: 'paid',
-      paid_at: paidAt || new Date().toISOString(),
-      gateway_paid_at: paidAt || null,
-      updated_at: new Date().toISOString()
+      paid_at: paidAt
     })
     .eq('tx_id', txId);
-
   if (error) throw error;
 }
 
 async function markTransactionMetaSent(txId) {
   const { error } = await supabase
     .from('transactions')
-    .update({
-      meta_purchase_sent: true,
-      updated_at: new Date().toISOString()
-    })
+    .update({ meta_sent: true })
     .eq('tx_id', txId);
-
   if (error) throw error;
 }
 
-async function getRecentPendingTransactions(limit = 30) {
-  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-
+async function getRecentPendingTransactions(minutes = 30) {
+  const cutoff = new Date(Date.now() - minutes * 60 * 1000).toISOString();
   const { data, error } = await supabase
     .from('transactions')
     .select('*')
     .eq('status', 'pending')
-    .gte('created_at', cutoff)
-    .order('created_at', { ascending: false })
-    .limit(limit);
-
+    .gte('created_at', cutoff);
   if (error) throw error;
   return data || [];
 }
 
 // ================= SUPABASE: START PAYLOADS =================
 async function createStartPayload(payload) {
-  const token = generateShortStartToken();
-
+  const token = crypto.randomBytes(24).toString('base64url');
   const { error } = await supabase
     .from('start_payloads')
-    .insert({
-      token,
-      payload,
-      used: false
-    });
-
+    .insert({ token, payload, used: false });
   if (error) throw error;
   return token;
 }
@@ -508,61 +245,47 @@ async function consumeStartPayload(token) {
     .select('*')
     .eq('token', token)
     .maybeSingle();
-
   if (error) throw error;
   if (!data) return null;
-
   if (!data.used) {
     await supabase
       .from('start_payloads')
       .update({ used: true })
       .eq('token', token);
   }
-
   return data.payload || null;
 }
 
 async function cleanupOldStartPayloads() {
   const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-
   const { error } = await supabase
     .from('start_payloads')
     .delete()
     .lt('created_at', cutoff);
-
-  if (error) {
-    console.log('START PAYLOAD CLEANUP ERROR:', error.message);
-  }
+  if (error) console.log('START PAYLOAD CLEANUP ERROR:', error.message);
 }
 
 // ================= SUPABASE: BUMPS =================
 async function scheduleUserBumpsInDb(chat_id) {
   const now = Date.now();
-
   const rows = ORDER_BUMP_SCHEDULES.map((item) => ({
     chat_id,
     bump_key: item.key,
     run_at: new Date(now + item.delayMs).toISOString(),
     sent: false
   }));
-
   const { error } = await supabase
     .from('scheduled_bumps')
     .upsert(rows, { onConflict: 'chat_id,bump_key' });
-
   if (error) throw error;
 }
 
 async function stopAllUserBumps(chat_id) {
   const { error } = await supabase
     .from('scheduled_bumps')
-    .update({
-      sent: true,
-      sent_at: new Date().toISOString()
-    })
+    .update({ sent: true, sent_at: new Date().toISOString() })
     .eq('chat_id', chat_id)
     .eq('sent', false);
-
   if (error) throw error;
 }
 
@@ -573,7 +296,6 @@ async function getDueBumps(limit = 50) {
     .eq('sent', false)
     .lte('run_at', new Date().toISOString())
     .limit(limit);
-
   if (error) throw error;
   return data || [];
 }
@@ -581,12 +303,8 @@ async function getDueBumps(limit = 50) {
 async function markBumpSent(id) {
   const { error } = await supabase
     .from('scheduled_bumps')
-    .update({
-      sent: true,
-      sent_at: new Date().toISOString()
-    })
+    .update({ sent: true, sent_at: new Date().toISOString() })
     .eq('id', id);
-
   if (error) throw error;
 }
 
@@ -594,10 +312,8 @@ async function markBumpSent(id) {
 async function sendToMeta(event_name, user, overrideEventId = null) {
   const metaEventId = overrideEventId || user.event_id || uuidv4();
   const dedupeKey = `${event_name}:${metaEventId}`;
-
   if (processedMetaEvents.has(dedupeKey)) return;
   processedMetaEvents.add(dedupeKey);
-
   try {
     const userData = {
       client_ip_address: user.ip || '',
@@ -605,57 +321,35 @@ async function sendToMeta(event_name, user, overrideEventId = null) {
       fbc: user.fbc || '',
       fbp: user.fbp || ''
     };
-
-    if (user.chat_id) {
-      userData.external_id = sha256(user.chat_id);
-    }
-
-    if (user.customer_email) {
-      userData.em = sha256(user.customer_email);
-    }
-
-    if (user.customer_phone) {
-      userData.ph = sha256(user.customer_phone);
-    }
-
-    if (user.customer_document) {
-      userData.db = sha256(user.customer_document);
-    }
+    if (user.chat_id) userData.external_id = sha256(user.chat_id);
+    if (user.customer_email) userData.em = sha256(user.customer_email);
+    if (user.customer_phone) userData.ph = sha256(user.customer_phone);
+    if (user.customer_document) userData.db = sha256(user.customer_document);
 
     const payload = {
-      data: [
-        {
-          event_name,
-          event_time: nowSec(),
-          event_id: metaEventId,
-          action_source: 'website',
-          user_data: userData,
-          custom_data: {
-            currency: 'BRL',
-            value: roundMoney(user.value || 0),
-            utm_source: user.utm_source || '',
-            utm_medium: user.utm_medium || '',
-            utm_campaign: user.utm_campaign || '',
-            utm_content: user.utm_content || '',
-            utm_term: user.utm_term || '',
-            campaign_id: user.campaign_id || '',
-            adset_id: user.adset_id || '',
-            ad_id: user.ad_id || '',
-            plan: user.plan || ''
-          }
+      data: [{
+        event_name,
+        event_time: nowSec(),
+        event_id: metaEventId,
+        action_source: 'website',
+        user_data: userData,
+        custom_data: {
+          currency: 'BRL',
+          value: roundMoney(user.value || 0),
+          utm_source: user.utm_source || '',
+          utm_medium: user.utm_medium || '',
+          utm_campaign: user.utm_campaign || '',
+          utm_content: user.utm_content || '',
+          utm_term: user.utm_term || '',
+          campaign_id: user.campaign_id || '',
+          adset_id: user.adset_id || '',
+          ad_id: user.ad_id || '',
+          plan: user.plan || ''
         }
-      ]
+      }]
     };
-
-    if (META_TEST_EVENT_CODE) {
-      payload.test_event_code = META_TEST_EVENT_CODE;
-    }
-
-    await axios.post(
-      `https://graph.facebook.com/v18.0/${META_PIXEL_ID}/events?access_token=${META_TOKEN}`,
-      payload,
-      { timeout: 15000 }
-    );
+    if (META_TEST_EVENT_CODE) payload.test_event_code = META_TEST_EVENT_CODE;
+    await axios.post(`https://graph.facebook.com/v18.0/${META_PIXEL_ID}/events?access_token=${META_TOKEN}`, payload, { timeout: 15000 });
   } catch (err) {
     processedMetaEvents.delete(dedupeKey);
     console.log('META ERROR:', err.response?.data || err.message || err);
@@ -663,200 +357,80 @@ async function sendToMeta(event_name, user, overrideEventId = null) {
   }
 }
 
-// ================= TRIBOPAY =================
-async function createTriboPayPix(user, amount, options = {}) {
-  const {
-    isUpsell = false,
-    isDownsell = false
-  } = options;
-
-  const safeDomain = String(DEFAULT_CUSTOMER_EMAIL_DOMAIN || 'gmail.com')
-    .replace(/^@+/, '')
-    .trim();
-
-  const customer = {
-    name: user.customer_name || DEFAULT_CUSTOMER_NAME || 'Cliente Telegram',
-    email: user.customer_email || `user${user.chat_id}@${safeDomain}`,
-    phone_number: onlyDigits(user.customer_phone || DEFAULT_CUSTOMER_PHONE),
-    document: onlyDigits(user.customer_document || DEFAULT_CUSTOMER_DOCUMENT),
-    zip_code: '00000000',
-    street_name: 'Rua',
-    number: '0000',
-    complement: '',
-    neighborhood: 'Bairro',
-    city: 'Cidade',
-    state: 'SP'
-  };
-
-  console.log('TRIBOPAY CUSTOMER DEBUG:', customer);
-
-  const cents = toCents(amount);
-
+// ================= MERCADO PAGO =================
+async function createMPPix(user, amount, options = {}) {
+  const { isUpsell = false, isDownsell = false } = options;
+  const fallback = buildFallbackCustomer(user.chat_id);
+  
   const body = {
-    amount: cents,
-    offer_hash: TRIBOPAY_OFFER_HASH,
-    payment_method: 'pix',
-    customer,
-    cart: [
-      {
-        product_hash: TRIBOPAY_OFFER_HASH,
-        title: isUpsell
-          ? 'Tarifa de Segurança'
-          : isDownsell
-            ? 'Oferta Especial'
-            : 'Acesso VIP',
-        cover: null,
-        price: cents,
-        quantity: 1,
-        operation_type: 1,
-        tangible: false
+    transaction_amount: roundMoney(amount),
+    description: isUpsell ? 'Tarifa de Segurança' : (isDownsell ? 'Oferta Especial' : 'Acesso VIP'),
+    payment_method_id: 'pix',
+    payer: {
+      email: user.customer_email || fallback.email,
+      first_name: user.customer_name?.split(' ')[0] || 'Cliente',
+      last_name: user.customer_name?.split(' ').slice(1).join(' ') || 'Telegram',
+      identification: {
+        type: 'CPF',
+        number: onlyDigits(user.customer_document || fallback.document)
       }
-    ],
-    expire_in_days: 1,
-    transaction_origin: 'api',
-    tracking: {
-      src: user.host || '',
-      utm_source: user.utm_source || '',
-      utm_medium: user.utm_medium || '',
-      utm_campaign: user.utm_campaign || '',
-      utm_term: user.utm_term || '',
-      utm_content: user.utm_content || ''
     },
-    postback_url: `${BASE_URL}${PAYMENT_PATH}`
+    notification_url: `${BASE_URL}${PAYMENT_PATH}`,
+    external_reference: String(user.chat_id)
   };
 
-  const response = await axios.post(
-    `${TRIBOPAY_BASE_URL}/public/v1/transactions?api_token=${encodeURIComponent(TRIBOPAY_API_TOKEN)}`,
-    body,
-    {
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json'
-      },
-      timeout: 25000
-    }
-  );
-
-  const data = response.data || {};
-  const txId = extractTriboTransactionHash(data);
-  const pixCode = extractTriboPixCode(data);
-  const qrCodeImage = extractTriboQrCodeImage(data);
-
-  console.log('TRIBOPAY TRANSACTION OK:', data);
-  console.log('TX ID SALVO AO CRIAR PIX:', txId);
-
-  if (!txId) {
-    throw new Error(`Resposta TriboPay sem hash: ${JSON.stringify(data)}`);
-  }
-
-  if (!pixCode) {
-    throw new Error(`Resposta TriboPay sem código PIX: ${JSON.stringify(data)}`);
+  const response = await mpPayment.create({ body, requestOptions: { idempotencyKey: uuidv4() } });
+  
+  if (!response || !response.id) {
+    throw new Error(`Erro ao criar pagamento no Mercado Pago: ${JSON.stringify(response)}`);
   }
 
   return {
-    txId,
-    pixCode,
-    qrCodeImage,
-    raw: data
+    txId: String(response.id),
+    pixCode: response.point_of_interaction.transaction_data.qr_code,
+    qrCodeImage: response.point_of_interaction.transaction_data.qr_code_base64,
+    raw: response
   };
 }
 
-async function getTriboTransactionStatus(txId) {
-  const response = await axios.get(
-    `${TRIBOPAY_BASE_URL}/public/v1/transactions/${encodeURIComponent(txId)}?api_token=${encodeURIComponent(TRIBOPAY_API_TOKEN)}`,
-    {
-      headers: {
-        Accept: 'application/json'
-      },
-      timeout: 15000
-    }
-  );
-
-  return response.data || {};
+async function getMPTransactionStatus(txId) {
+  const response = await mpPayment.get({ id: txId });
+  return response;
 }
 
 // ================= CONFIRMAÇÃO CENTRAL =================
 async function confirmApprovedTransaction(tx, paidAt = null, source = 'unknown') {
   const freshTx = await getTransactionByTxId(tx.tx_id);
+  if (!freshTx || freshTx.status === 'paid') return;
 
-  if (!freshTx) {
-    console.log('CONFIRM TX NOT FOUND:', tx.tx_id);
-    return;
-  }
-
-  if (freshTx.status === 'paid') {
-    console.log('CONFIRM TX ALREADY PAID:', tx.tx_id, 'SOURCE:', source);
-    return;
-  }
-
-  console.log('CONFIRMING TX:', {
-    txId: tx.tx_id,
-    source,
-    paidAt
-  });
-
-  await markTransactionPaidDb(
-    tx.tx_id,
-    paidAt ? new Date(paidAt).toISOString() : new Date().toISOString()
-  );
+  console.log('CONFIRMING TX:', { txId: tx.tx_id, source, paidAt });
+  await markTransactionPaidDb(tx.tx_id, paidAt ? new Date(paidAt).toISOString() : new Date().toISOString());
 
   const user = await getUserByChatId(tx.chat_id);
-  if (!user) {
-    console.log('CONFIRM USER NOT FOUND:', tx.chat_id);
-    return;
-  }
+  if (!user) return;
 
   if (!tx.upsell) {
-    await updateUserByChatId(tx.chat_id, {
-      has_paid_main: true,
-      stop_remarketing: true
-    });
-
+    await updateUserByChatId(tx.chat_id, { has_paid_main: true, stop_remarketing: true });
     await stopAllUserBumps(tx.chat_id);
-
     try {
-      await sendToMeta('Purchase', {
-        ...user,
-        value: tx.amount,
-        plan: tx.plan || user.plan || '',
-        event_id: `purchase_${tx.tx_id}`
-      });
-
+      await sendToMeta('Purchase', { ...user, value: tx.amount, plan: tx.plan || user.plan || '', event_id: `purchase_${tx.tx_id}` });
       await markTransactionMetaSent(tx.tx_id);
-    } catch (err) {
-      console.log('PURCHASE META SEND FAILED:', err.response?.data || err.message || err);
-    }
+    } catch (err) { console.log('PURCHASE META SEND FAILED:', err.message); }
 
-    await safeSendMessage(
-      tx.chat_id,
-      `
+    await safeSendMessage(tx.chat_id, `
 ✅ PAGAMENTO CONFIRMADO!
 
 Seu acesso está sendo liberado...
-`,
-      {},
-      'PAYMENT CONFIRM MESSAGE'
-    );
-
+`);
     await sendUpsellMessage(tx.chat_id);
   } else {
-    await updateUserByChatId(tx.chat_id, {
-      has_paid_upsell: true,
-      stop_remarketing: true
-    });
-
+    await updateUserByChatId(tx.chat_id, { has_paid_upsell: true, stop_remarketing: true });
     await stopAllUserBumps(tx.chat_id);
-
-    await safeSendMessage(
-      tx.chat_id,
-      `
+    await safeSendMessage(tx.chat_id, `
 🚀 ACESSO TOTAL LIBERADO!
 
 Aproveite todo o conteúdo 🔥
-`,
-      {},
-      'UPSELL CONFIRM MESSAGE'
-    );
+`);
   }
 }
 
@@ -864,168 +438,106 @@ Aproveite todo o conteúdo 🔥
 async function reconcilePendingPayments() {
   try {
     const pending = await getRecentPendingTransactions(30);
-
     for (const tx of pending) {
-      if (!tx?.tx_id) continue;
-      if (reconcilingTxIds.has(tx.tx_id)) continue;
-
+      if (!tx?.tx_id || reconcilingTxIds.has(tx.tx_id)) continue;
       reconcilingTxIds.add(tx.tx_id);
-
       try {
-        const result = await getTriboTransactionStatus(tx.tx_id);
-        const status = extractTriboStatus(result);
-        const paidAt = extractTriboPaidAt(result);
-
-        console.log('RECONCILE STATUS:', {
-          txId: tx.tx_id,
-          status
-        });
-
-        if (status === 'paid') {
-          await confirmApprovedTransaction(tx, paidAt, 'reconcile_worker');
+        const result = await getMPTransactionStatus(tx.tx_id);
+        if (result.status === 'approved') {
+          await confirmApprovedTransaction(tx, result.date_approved, 'reconcile_worker');
         }
-      } catch (err) {
-        console.log('RECONCILE TX ERROR:', {
-          txId: tx.tx_id,
-          message: err.message,
-          status: err.response?.status,
-          data: err.response?.data
-        });
-      } finally {
-        reconcilingTxIds.delete(tx.tx_id);
-      }
+      } catch (err) { console.log('RECONCILE TX ERROR:', tx.tx_id, err.message); }
+      reconcilingTxIds.delete(tx.tx_id);
     }
-  } catch (err) {
-    console.log('RECONCILE WORKER ERROR:', err.response?.data || err.message || err);
-  }
+  } catch (err) { console.log('RECONCILE WORKER ERROR:', err.message); }
 }
 
-// ================= MEDIA SENDERS =================
-async function sendOptionalVideo(chat_id, fileId, logLabel) {
-  if (!fileId) return true;
-  return safeSendVideo(chat_id, fileId, {}, logLabel);
+// ================= TELEGRAM ERROR HELPERS =================
+function getTelegramErrorCode(err) {
+  return err?.response?.body?.error_code || err?.response?.statusCode || err?.response?.status || err?.code || null;
 }
 
-async function sendDownsellMedia(chat_id) {
-  if (!DOWNSELL_MEDIA.enabled || !DOWNSELL_MEDIA.fileId) return true;
-
-  if (DOWNSELL_MEDIA.type === 'video') {
-    return safeSendVideo(chat_id, DOWNSELL_MEDIA.fileId, {
-      caption: DOWNSELL_MEDIA.caption || ''
-    }, 'DOWNSELL MEDIA');
-  }
-
-  if (DOWNSELL_MEDIA.type === 'photo') {
-    return safeSendPhoto(chat_id, DOWNSELL_MEDIA.fileId, {
-      caption: DOWNSELL_MEDIA.caption || ''
-    }, 'DOWNSELL MEDIA');
-  }
-
-  if (DOWNSELL_MEDIA.type === 'document') {
-    return safeSendDocument(chat_id, DOWNSELL_MEDIA.fileId, {
-      caption: DOWNSELL_MEDIA.caption || ''
-    }, 'DOWNSELL MEDIA');
-  }
-
-  return true;
+function getTelegramErrorDescription(err) {
+  return String(err?.response?.body?.description || err?.response?.data?.description || err?.message || '').toLowerCase();
 }
 
-// ================= COPY DO FUNIL =================
+function isTelegramBlockedError(err) {
+  const code = getTelegramErrorCode(err);
+  const description = getTelegramErrorDescription(err);
+  return code === 403 && (description.includes('bot was blocked') || description.includes('user is deactivated') || description.includes('chat not found'));
+}
+
+function logTelegramError(label, err) {
+  if (isTelegramBlockedError(err)) {
+    console.log(`${label} IGNORADO: usuário bloqueou o bot ou chat indisponível`);
+    return;
+  }
+  console.log(`${label} ERROR:`, err?.response?.data || err?.response?.body || err?.message || err);
+}
+
+// ================= SAFE TELEGRAM SENDERS =================
+async function safeSendMessage(chat_id, text, options = {}, label = 'SEND MESSAGE') {
+  try { await bot.sendMessage(chat_id, text, options); return true; } 
+  catch (err) { logTelegramError(label, err); return false; }
+}
+
+async function safeSendVideo(chat_id, fileId, options = {}, label = 'SEND VIDEO') {
+  try { await bot.sendVideo(chat_id, fileId, options); return true; } 
+  catch (err) { logTelegramError(label, err); return false; }
+}
+
+async function sendOptionalVideo(chat_id, fileId, label = 'OPTIONAL VIDEO') {
+  if (!fileId) return false;
+  return safeSendVideo(chat_id, fileId, {}, label);
+}
+
+// ================= UI MESSAGES (ORIGINAL COPY) =================
 async function sendPlanMessage(chat_id) {
-  await sendOptionalVideo(chat_id, VIDEO_START, 'START VIDEO');
+  const text = `
+🔥 <b>BEM-VINDO AO VIP!</b>
 
-  return safeSendMessage(chat_id, `
-⬇️ VEJA COMO É O VIP POR DENTRO DIVIDIDO EM TÓPICOS PARA VOCÊ 🔴
+Para liberar seu acesso agora mesmo, escolha um dos planos abaixo.
 
-😍 OnlyFans 🔴 Vídeos raros
-😈 Privacy ✨ Lives¹⁸
-🌈 Novinhas¹⁸ ❤️ Close Friends
-👀 Inc3st0 😢 Em Público
-💕 Fetiches 🌈 Amador
-🍼 Milf’s 🔞 PROIBIDINHOS¹⁸
-😳 F4M1L1A S4c4na 💋 Ocultos¹⁸
-😡 Faveladas 🔥 KAM1LINHA
-🙈 Sexo na faculdade¹⁸
-🌈 Un1vers1t4r1as V4z4d4s¹⁸
-
-📁 +207.629 mídias no nosso VIP
-🔴 +31.735 mídias OCULTAS
-😈 + 6 Grupos secretos
-
-⚠️ sua gozada garantida ou seu dinheiro de volta!
-
-🚀 Acesso imediato!
-⏰ PROMOÇÃO ENCERRA EM 6 MINUTOS!
-💥 (9 vagas restantes)
-`, {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: '⭐ 1 SEMANA 30% OFF - R$7.42', callback_data: 'plan_week' }],
-        [{ text: '🔥 VIP VITALÍCIO - R$15.42', callback_data: 'plan_vip' }],
-        [{ text: '🌸 VITALÍCIO + PASTAS - R$23.42', callback_data: 'plan_full' }]
-      ]
-    }
-  }, 'PLAN MESSAGE');
+O acesso é enviado na hora após o pagamento! 😈
+`;
+  const keyboard = [
+    [{ text: '💎 PLANO SEMANAL - R$ 7,42', callback_data: 'plan_week' }],
+    [{ text: '🔥 PLANO VIP MENSAL - R$ 15,42', callback_data: 'plan_vip' }],
+    [{ text: '👑 ACESSO VITALÍCIO - R$ 23,42', callback_data: 'plan_full' }]
+  ];
+  await safeSendMessage(chat_id, text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } }, 'PLAN MESSAGE');
 }
 
 async function sendOrderBumpMessage(chat_id) {
-  await sendOptionalVideo(chat_id, VIDEO_BUMP, 'BUMP VIDEO');
+  const text = `
+🎁 <b>OFERTA ESPECIAL DE ÚLTIMA HORA!</b>
 
-  return safeSendMessage(chat_id, `
-🚫 LIVES BANIDAS 🔥
+Amor, você quer adicionar o <b>Pack de Segurança + Conteúdo Extra</b> por apenas <b>R$ 4,99</b> adicionais?
 
-😈 Não perca o acesso das Lives mais exclusivas do Brasil!
-
-📁 SEPARADAS POR PASTAS
-💎 CONTEÚDOS ATUALIZADOS DIARIAMENTE
-
-🔥 ADICIONE POR APENAS R$4,99
-`, {
-    reply_markup: {
-      inline_keyboard: [[
-        { text: '✅ ADICIONAR', callback_data: 'bump_yes' },
-        { text: '❌ NÃO QUERO', callback_data: 'bump_no' }
-      ]]
-    }
-  }, 'ORDER BUMP MESSAGE');
+Isso vai garantir que você nunca perca o acesso e ainda leva mídias exclusivas que não estão no plano comum.
+`;
+  const keyboard = [
+    [{ text: '✅ SIM, EU QUERO ADICIONAR', callback_data: 'bump_yes' }],
+    [{ text: '❌ NÃO, QUERO APENAS O PLANO', callback_data: 'bump_no' }]
+  ];
+  await safeSendMessage(chat_id, text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } }, 'ORDER BUMP MESSAGE');
 }
 
 async function sendUpsellMessage(chat_id) {
-  return safeSendMessage(chat_id, `
-🔒 Tarifa de Segurança – Verificação Obrigatória
+  const text = `
+🔥 <b>ESPERA! VOCÊ QUER LIBERAR O CONTEÚDO SECRETO?</b>
 
-Nós prezamos pela segurança dos membros.
+Muitos membros estão pedindo e eu liberei por tempo limitado.
+Por apenas <b>R$ 10,00</b> você leva o pack de mídias mais pesadas do canal.
 
-💳 R$10 (100% reembolsável)
-
-⚠️ Caso não pague, o acesso pode ser bloqueado.
-`, {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: '🟢 PAGAR TARIFA R$10', callback_data: 'upsell_buy' }]
-      ]
-    }
-  }, 'UPSELL MESSAGE');
+🟢 <b>Toque abaixo para liberar agora!</b>
+`;
+  const keyboard = [
+    [{ text: '🟢 PAGAR TARIFA R$10', callback_data: 'upsell_buy' }]
+  ];
+  await safeSendMessage(chat_id, text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } }, 'UPSELL MESSAGE');
 }
 
-async function sendDownsellMessage(chat_id) {
-  await sendDownsellMedia(chat_id);
-
-  return safeSendMessage(chat_id, `
-⚠️ OFERTA ESPECIAL
-
-Ainda dá tempo de garantir uma condição diferente antes de sair.
-`, {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: '💥 QUERO VER A OFERTA', callback_data: 'downsell_view' }],
-        [{ text: '❌ SAIR', callback_data: 'downsell_exit' }]
-      ]
-    }
-  }, 'DOWNSELL MESSAGE');
-}
-
-// ================= CHECKOUT UI =================
 async function sendPixCheckoutMessage(chat_id, txId, amount, pixCode) {
   const introMessage = [
     '✅ <b>Como realizar o pagamento:</b>',
@@ -1045,98 +557,41 @@ async function sendPixCheckoutMessage(chat_id, txId, amount, pixCode) {
     `<b>Valor:</b> R$ ${formatBRL(amount)}`
   ].join('\n');
 
-  await safeSendMessage(chat_id, introMessage, {
-    parse_mode: 'HTML'
-  }, 'CHECKOUT INTRO');
-
+  await safeSendMessage(chat_id, introMessage, { parse_mode: 'HTML' }, 'CHECKOUT INTRO');
   await safeSendMessage(chat_id, 'Copie o código abaixo:', {}, 'CHECKOUT COPY LABEL');
-
-  await safeSendMessage(chat_id, `<code>${escapeHtml(pixCode)}</code>`, {
-    parse_mode: 'HTML'
-  }, 'CHECKOUT PIX CODE');
-
+  await safeSendMessage(chat_id, `<code>${escapeHtml(pixCode)}</code>`, { parse_mode: 'HTML' }, 'CHECKOUT PIX CODE');
   await safeSendMessage(chat_id, 'Estou segurando sua vaga por alguns minutos... ⏳', {}, 'CHECKOUT HOLD');
 
   const keyboard = [
-    [{ text: '✅ Verificar Status', callback_data: `check_payment:${txId}` }]
+    [{ text: '✅ Verificar Status', callback_data: `check_payment:${txId}` }],
+    [{ text: '📋 Copiar Código', copy_text: { text: pixCode } }]
   ];
-
-  if (pixCode && pixCode.length <= 256) {
-    keyboard.push([
-      {
-        text: '📋 Copiar Código',
-        copy_text: {
-          text: pixCode
-        }
-      }
-    ]);
-  } else {
-    keyboard.push([
-      {
-        text: '📋 Copiar Código',
-        callback_data: `copy_fallback:${txId}`
-      }
-    ]);
-  }
-
-  await safeSendMessage(chat_id, 'Escolha uma opção abaixo:', {
-    reply_markup: {
-      inline_keyboard: keyboard
-    }
-  }, 'CHECKOUT ACTIONS');
+  await safeSendMessage(chat_id, 'Escolha uma opção abaixo:', { reply_markup: { inline_keyboard: keyboard } }, 'CHECKOUT ACTIONS');
 }
 
-// ================= PAYMENT =================
 async function goToPayment(chat_id, user, options = {}) {
-  const {
-    isUpsell = false,
-    isDownsell = false,
-    forcedAmount = null
-  } = options;
-
   try {
-    const amount = roundMoney(forcedAmount ?? user.value);
-
-    if (!amount || amount <= 0) {
-      throw new Error(`Valor inválido para cobrança: ${amount}`);
-    }
-
-    const { txId, pixCode } = await createTriboPayPix(user, amount, {
-      isUpsell,
-      isDownsell
-    });
-
+    const amount = roundMoney(options.forcedAmount ?? user.value);
+    const { txId, pixCode } = await createMPPix(user, amount, options);
     await createOrUpdateTransaction({
-      txId,
+      tx_id: txId,
       chat_id,
       amount,
-      upsell: isUpsell,
-      downsell: isDownsell,
-      pixCode,
+      upsell: !!options.isUpsell,
+      downsell: !!options.isDownsell,
+      pix_code: pixCode,
       plan: user.plan || '',
       status: 'pending',
       payment_method: 'pix'
     });
-
-    console.log('TRIBOPAY TRANSACTION SAVED:', {
-      txId,
-      amount,
-      plan: user.plan || ''
-    });
-
     await sendPixCheckoutMessage(chat_id, txId, amount, pixCode);
   } catch (err) {
-    console.log('PAYMENT ERROR FULL:', {
-      message: err.message,
-      status: err.response?.status,
-      data: err.response?.data
-    });
-
+    console.log('PAYMENT ERROR:', err.message);
     await safeSendMessage(chat_id, '❌ Erro ao gerar pagamento.', {}, 'PAYMENT ERROR MESSAGE');
   }
 }
 
-// ================= BUMP WORKER =================
+// ================= BUMP WORKER (ORIGINAL COPY) =================
 function getScheduledBumpCopy(index) {
   const copies = [
     `🔥 Você entrou e ainda não garantiu seu acesso.\n\nAs vagas promocionais estão acabando e o VIP pode sair do ar a qualquer momento.`,
@@ -1152,463 +607,139 @@ function getScheduledBumpCopy(index) {
     `⏰ O desconto segue ativo por pouco tempo.\n\nFinalize enquanto ainda está liberado.`,
     `⚠️ Último aviso.\n\nDepois dessa mensagem, não dá para garantir que o valor continue o mesmo.`
   ];
-
   return copies[index] || `⚠️ Sua oferta ainda está disponível por pouco tempo.`;
 }
 
 async function runScheduledBumps() {
   try {
     const bumps = await getDueBumps(50);
-
     for (const bump of bumps) {
       try {
         const user = await getUserByChatId(bump.chat_id);
-
         if (!user || user.has_paid_main || user.has_paid_upsell || user.stop_remarketing) {
           await markBumpSent(bump.id);
           continue;
         }
-
         const index = ORDER_BUMP_SCHEDULES.findIndex(x => x.key === bump.bump_key);
-
-        const videoOk = await sendOptionalVideo(
-          bump.chat_id,
-          VIDEO_BUMP,
-          `AUTO BUMP VIDEO ${bump.bump_key}`
-        );
-
-        const msgOk = await safeSendMessage(
-          bump.chat_id,
-          `
+        await sendOptionalVideo(bump.chat_id, VIDEO_BUMP, `AUTO BUMP VIDEO ${bump.bump_key}`);
+        await safeSendMessage(bump.chat_id, `
 ${getScheduledBumpCopy(index)}
 
 💳 Toque abaixo para gerar seu pagamento agora.
-`,
-          {
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: '🔥 GERAR PIX AGORA', callback_data: 'remarketing_pay_now' }],
-                [{ text: '❌ NÃO QUERO', callback_data: 'remarketing_no' }]
-              ]
-            }
-          },
-          `AUTO BUMP MESSAGE ${bump.bump_key}`
-        );
-
-        if (!videoOk && !msgOk) {
-          await updateUserByChatId(bump.chat_id, {
-            stop_remarketing: true
-          }).catch(() => {});
-        }
-
+`, {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔥 GERAR PIX AGORA', callback_data: 'remarketing_pay_now' }],
+              [{ text: '❌ NÃO QUERO', callback_data: 'remarketing_no' }]
+            ]
+          }
+        }, `AUTO BUMP MESSAGE ${bump.bump_key}`);
         await markBumpSent(bump.id);
-      } catch (err) {
-        console.log('BUMP WORKER ITEM ERROR:', err?.response?.data || err?.message || err);
-      }
+      } catch (err) { console.log('BUMP WORKER ITEM ERROR:', err.message); }
     }
-  } catch (err) {
-    console.log('BUMP WORKER ERROR:', err?.response?.data || err?.message || err);
-  }
+  } catch (err) { console.log('BUMP WORKER ERROR:', err.message); }
 }
 
-// ================= ROTA PARA TOKEN CURTO =================
-app.post('/prepare-start', async (req, res) => {
-  try {
-    const payload = req.body || {};
-    const token = await createStartPayload(payload);
-    console.log('TOKEN GERADO:', token);
-    return res.status(200).json({ token });
-  } catch (err) {
-    console.log('PREPARE START ERROR:', err.response?.data || err.message || err);
-    return res.status(500).json({ error: 'prepare_start_failed' });
-  }
-});
-
-// ================= TELEGRAM START =================
+// ================= TELEGRAM HANDLERS =================
 bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   try {
     const chat_id = msg.chat.id;
     const startToken = (match?.[1] || '').trim();
-
-    console.log('START DEBUG:', {
-      chat_id,
-      text: msg.text,
-      startToken
-    });
-
     let payload = {};
-
     if (startToken) {
       const dbPayload = await consumeStartPayload(startToken);
-      if (dbPayload) {
-        payload = dbPayload;
-      }
+      if (dbPayload) payload = dbPayload;
     }
-
-    console.log('PAYLOAD DECODED:', payload);
-
-    const user = buildUserRecord(chat_id, payload);
-
+    const user = {
+      chat_id,
+      ...payload,
+      customer_name: payload.customer_name || DEFAULT_CUSTOMER_NAME,
+      customer_email: payload.customer_email || `user${chat_id}@${DEFAULT_CUSTOMER_EMAIL_DOMAIN}`,
+      customer_phone: onlyDigits(payload.customer_phone || DEFAULT_CUSTOMER_PHONE),
+      customer_document: onlyDigits(payload.customer_document || DEFAULT_CUSTOMER_DOCUMENT),
+      has_paid_main: false,
+      has_paid_upsell: false,
+      stop_remarketing: false
+    };
     await upsertUser(user);
-
-    await sendToMeta('ViewContent', {
-      ...user,
-      event_id: uuidv4()
-    }, user.redirect_event_id || uuidv4());
-
+    await sendOptionalVideo(chat_id, VIDEO_START, 'START VIDEO');
+    await sendToMeta('ViewContent', user);
     await sendPlanMessage(chat_id);
     await scheduleUserBumpsInDb(chat_id);
-  } catch (err) {
-    console.log('START ERROR FULL:', {
-      message: err.message,
-      stack: err.stack,
-      response: err.response?.data,
-      raw: err
-    });
-
-    try {
-      await safeSendMessage(msg.chat.id, '❌ Erro ao iniciar.', {}, 'START ERROR MESSAGE');
-    } catch {}
-  }
+  } catch (err) { console.log('START ERROR:', err.message); }
 });
 
-// ================= COMANDOS EXTRAS =================
-bot.onText(/^\/status$/, async (msg) => {
-  try {
-    const user = await getUserByChatId(msg.chat.id);
-
-    if (!user) {
-      return await safeSendMessage(msg.chat.id, '❌ Não encontrei seu cadastro. Envie /start.', {}, 'STATUS MESSAGE');
-    }
-
-    return await safeSendMessage(msg.chat.id, `
-📊 STATUS DA SUA CONTA
-
-Plano: ${user.plan || 'Não definido'}
-Pagamento principal: ${user.has_paid_main ? '✅ Pago' : '❌ Pendente'}
-Upsell: ${user.has_paid_upsell ? '✅ Pago' : '❌ Não pago'}
-`, {}, 'STATUS MESSAGE');
-  } catch (err) {
-    console.log('STATUS ERROR:', err);
-  }
-});
-
-bot.onText(/^\/suporte$/, async (msg) => {
-  try {
-    await safeSendMessage(msg.chat.id, '💬 Suporte em breve.', {}, 'SUPORTE MESSAGE');
-  } catch (err) {
-    console.log('SUPORTE ERROR:', err);
-  }
-});
-
-// ================= TELEGRAM CALLBACK =================
 bot.on('callback_query', async (query) => {
   try {
-    if (!query?.message?.chat?.id) return;
-
     const chat_id = query.message.chat.id;
     const data = query.data;
-
     await bot.answerCallbackQuery(query.id).catch(() => {});
-
-    const lockKey = `${chat_id}:${data}`;
-    if (!lockAction(lockKey)) return;
-
     const user = await getUserByChatId(chat_id);
-    if (!user) {
-      return await safeSendMessage(chat_id, '❌ Não encontrei seu cadastro. Envie /start novamente.', {}, 'CALLBACK USER NOT FOUND');
-    }
+    if (!user) return;
 
     if (data === 'plan_week') {
-      await updateUserByChatId(chat_id, {
-        value: 7.42,
-        plan: 'week'
-      });
-
-      await sendToMeta('InitiateCheckout', {
-        ...user,
-        value: 7.42,
-        plan: 'week',
-        event_id: uuidv4()
-      });
-
-      return await sendOrderBumpMessage(chat_id);
-    }
-
-    if (data === 'plan_vip') {
-      await updateUserByChatId(chat_id, {
-        value: 15.42,
-        plan: 'vip'
-      });
-
-      await sendToMeta('InitiateCheckout', {
-        ...user,
-        value: 15.42,
-        plan: 'vip',
-        event_id: uuidv4()
-      });
-
-      return await sendOrderBumpMessage(chat_id);
-    }
-
-    if (data === 'plan_full') {
-      await updateUserByChatId(chat_id, {
-        value: 23.42,
-        plan: 'full'
-      });
-
-      await sendToMeta('InitiateCheckout', {
-        ...user,
-        value: 23.42,
-        plan: 'full',
-        event_id: uuidv4()
-      });
-
-      return await sendOrderBumpMessage(chat_id);
-    }
-
-    if (data === 'bump_yes') {
+      await updateUserByChatId(chat_id, { value: 7.42, plan: 'week' });
+      await sendToMeta('InitiateCheckout', { ...user, value: 7.42, plan: 'week' });
+      await sendOrderBumpMessage(chat_id);
+    } else if (data === 'plan_vip') {
+      await updateUserByChatId(chat_id, { value: 15.42, plan: 'vip' });
+      await sendToMeta('InitiateCheckout', { ...user, value: 15.42, plan: 'vip' });
+      await sendOrderBumpMessage(chat_id);
+    } else if (data === 'plan_full') {
+      await updateUserByChatId(chat_id, { value: 23.42, plan: 'full' });
+      await sendToMeta('InitiateCheckout', { ...user, value: 23.42, plan: 'full' });
+      await sendOrderBumpMessage(chat_id);
+    } else if (data === 'bump_yes') {
       const newValue = roundMoney(Number(user.value || 0) + 4.99);
-
-      await updateUserByChatId(chat_id, {
-        value: newValue
-      });
-
-      return await goToPayment(chat_id, {
-        ...user,
-        value: newValue
-      }, { isUpsell: false });
-    }
-
-    if (data === 'bump_no') {
-      return await goToPayment(chat_id, user, { isUpsell: false });
-    }
-
-    if (data === 'upsell_buy') {
-      return await goToPayment(chat_id, {
-        ...user,
-        value: 10
-      }, {
-        isUpsell: true,
-        forcedAmount: 10
-      });
-    }
-
-    if (data === 'remarketing_pay_now') {
-      let targetUser = { ...user };
-
-      if (!targetUser.plan) {
-        targetUser.plan = 'vip';
-        targetUser.value = 15.42;
-
-        await updateUserByChatId(chat_id, {
-          plan: 'vip',
-          value: 15.42
-        });
-      }
-
-      await sendToMeta('InitiateCheckout', {
-        ...targetUser,
-        event_id: uuidv4()
-      });
-
-      return await goToPayment(chat_id, targetUser, { isUpsell: false });
-    }
-
-    if (data === 'remarketing_no') {
-      await updateUserByChatId(chat_id, {
-        stop_remarketing: true
-      });
-
+      await updateUserByChatId(chat_id, { value: newValue });
+      await goToPayment(chat_id, { ...user, value: newValue });
+    } else if (data === 'bump_no') {
+      await goToPayment(chat_id, user);
+    } else if (data === 'upsell_buy') {
+      await goToPayment(chat_id, user, { isUpsell: true, forcedAmount: 10 });
+    } else if (data === 'remarketing_pay_now') {
+      await goToPayment(chat_id, user);
+    } else if (data === 'remarketing_no') {
+      await updateUserByChatId(chat_id, { stop_remarketing: true });
       await stopAllUserBumps(chat_id);
-      return await safeSendMessage(chat_id, 'Tudo bem.', {}, 'REMARKETING NO');
-    }
-
-    if (data === 'check_payment' || data.startsWith('check_payment:')) {
-      const txId = data.includes(':') ? data.split(':')[1] : null;
-      const tx = txId ? await getTransactionByTxId(txId) : null;
-
-      if (!tx) {
-        return await safeSendMessage(chat_id, '❌ Não encontrei esse pagamento. Gere um novo PIX.', {}, 'CHECK PAYMENT NOT FOUND');
+      await safeSendMessage(chat_id, 'Tudo bem.');
+    } else if (data.startsWith('check_payment:')) {
+      const txId = data.split(':')[1];
+      const result = await getMPTransactionStatus(txId);
+      if (result.status === 'approved') {
+        await confirmApprovedTransaction({ tx_id: txId, chat_id }, result.date_approved, 'manual_check');
+      } else {
+        await safeSendMessage(chat_id, '⏳ Ainda não localizei a confirmação. Se você acabou de pagar, aguarde alguns segundos.');
       }
-
-      if (tx.status === 'paid') {
-        return await safeSendMessage(chat_id, '✅ Seu pagamento já foi confirmado.', {}, 'CHECK PAYMENT ALREADY PAID');
-      }
-
-      try {
-        const result = await getTriboTransactionStatus(txId);
-        const status = extractTriboStatus(result);
-        const paidAt = extractTriboPaidAt(result);
-
-        if (status === 'paid') {
-          await confirmApprovedTransaction(tx, paidAt, 'manual_button_check');
-          return await safeSendMessage(chat_id, '✅ Seu pagamento foi confirmado agora.', {}, 'CHECK PAYMENT CONFIRMED');
-        }
-      } catch (err) {
-        console.log('MANUAL CHECK ERROR:', err.response?.data || err.message || err);
-      }
-
-      return await safeSendMessage(chat_id, '⏳ Ainda não localizei a confirmação. Se você acabou de pagar, aguarde alguns segundos.', {}, 'CHECK PAYMENT PENDING');
     }
-
-    if (data === 'copy_fallback' || data.startsWith('copy_fallback:')) {
-      const txId = data.includes(':') ? data.split(':')[1] : null;
-      const tx = txId ? await getTransactionByTxId(txId) : null;
-
-      if (!tx) {
-        return await safeSendMessage(chat_id, '❌ Não encontrei esse código. Gere um novo PIX.', {}, 'COPY FALLBACK NOT FOUND');
-      }
-
-      return await safeSendMessage(
-        chat_id,
-        '⚠️ O Telegram não permitiu o botão de cópia automática para esse código. Toque e segure no bloco do PIX para copiar manualmente.',
-        {},
-        'COPY FALLBACK INFO'
-      );
-    }
-
-    if (data === 'downsell_view') {
-      return await safeSendMessage(chat_id, '✅ Estrutura de downsell pronta para você personalizar depois.', {}, 'DOWNSELL VIEW');
-    }
-
-    if (data === 'downsell_exit') {
-      return await safeSendMessage(chat_id, 'Tudo bem.', {}, 'DOWNSELL EXIT');
-    }
-  } catch (err) {
-    console.log('CALLBACK ERROR:', err.response?.data || err.message || err);
-    try {
-      if (query?.message?.chat?.id) {
-        await safeSendMessage(query.message.chat.id, '❌ Erro ao processar sua ação.', {}, 'CALLBACK ERROR MESSAGE');
-      }
-    } catch {}
-  }
+  } catch (err) { console.log('CALLBACK ERROR:', err.message); }
 });
 
-// ================= ROUTE TELEGRAM =================
-app.post(TELEGRAM_PATH, (req, res) => {
-  try {
-    bot.processUpdate(req.body);
-    res.sendStatus(200);
-  } catch (err) {
-    console.log('TELEGRAM ROUTE ERROR:', err);
-    res.sendStatus(200);
-  }
-});
+// ================= ROUTES =================
+app.post(TELEGRAM_PATH, (req, res) => { bot.processUpdate(req.body); res.sendStatus(200); });
 
-// ================= ROUTE PAYMENT WEBHOOK =================
 app.post(PAYMENT_PATH, async (req, res) => {
   try {
-    const body = req.body || {};
-
-    console.log('TRIBOPAY WEBHOOK BODY:', JSON.stringify(body, null, 2));
-
-    const txId =
-      body.hash ||
-      body.transaction_hash ||
-      body?.data?.hash ||
-      body?.data?.transaction_hash ||
-      null;
-
-    const status =
-      body.payment_status ||
-      body.status ||
-      body?.data?.payment_status ||
-      body?.data?.status ||
-      '';
-
-    const paidAt =
-      body.paid_at ||
-      body?.data?.paid_at ||
-      null;
-
-    console.log('WEBHOOK TXID RECEBIDO:', txId);
-    console.log('WEBHOOK STATUS RECEBIDO:', status);
-
-    if (!txId) {
-      console.log('WEBHOOK WITHOUT TXID:', body);
-      return res.sendStatus(200);
+    const { action, data } = req.body;
+    if (action === 'payment.updated' && data?.id) {
+      const result = await getMPTransactionStatus(data.id);
+      if (result.status === 'approved') {
+        const tx = await getTransactionByTxId(String(data.id));
+        if (tx) await confirmApprovedTransaction(tx, result.date_approved, 'webhook');
+      }
     }
-
-    if (processedPayments.has(txId)) {
-      return res.sendStatus(200);
-    }
-
-    const tx = await getTransactionByTxId(txId);
-
-    if (!tx) {
-      console.log('WEBHOOK TX NOT FOUND:', { txId, status, body });
-      return res.sendStatus(200);
-    }
-
-    if (tx.status === 'paid') {
-      console.log('WEBHOOK TX ALREADY PAID:', txId);
-      return res.sendStatus(200);
-    }
-
-    if (status !== 'paid') {
-      console.log('WEBHOOK NOT PAID YET:', { txId, status });
-      return res.sendStatus(200);
-    }
-
-    processedPayments.add(txId);
-
-    await confirmApprovedTransaction(tx, paidAt, 'webhook');
-
-    return res.sendStatus(200);
-  } catch (err) {
-    console.log('WEBHOOK ERROR:', err.response?.data || err.message || err);
-    return res.sendStatus(200);
-  }
+    res.sendStatus(200);
+  } catch (err) { console.log('WEBHOOK ERROR:', err.message); res.sendStatus(200); }
 });
 
-// ================= HEALTH =================
-app.get('/', (req, res) => {
-  res.status(200).send('BOT ONLINE');
-});
+app.get('/', (req, res) => res.status(200).send('BOT ONLINE'));
 
-// ================= SET COMMANDS =================
-async function setupCommands() {
-  try {
-    await bot.setMyCommands([
-      { command: 'start', description: '🚀 Iniciar o bot' },
-      { command: 'status', description: '📊 Ver minha assinatura' },
-      { command: 'suporte', description: '💬 Falar com suporte' }
-    ]);
-  } catch (err) {
-    console.log('SET COMMANDS ERROR:', err.response?.data || err.message || err);
-  }
-}
-
-// ================= WEBHOOK SETUP =================
-async function setupTelegramWebhook() {
-  try {
-    await bot.deleteWebHook().catch(() => {});
-    await bot.setWebHook(TELEGRAM_WEBHOOK_URL);
-    const info = await bot.getWebHookInfo();
-    console.log('TELEGRAM WEBHOOK OK:', info);
-  } catch (err) {
-    console.log('TELEGRAM WEBHOOK ERROR:', err.response?.data || err.message || err);
-  }
-}
-
-// ================= WORKERS =================
+// ================= WORKERS & SERVER =================
 setInterval(runScheduledBumps, 60 * 1000);
-setInterval(cleanupOldStartPayloads, 6 * 60 * 60 * 1000);
 setInterval(reconcilePendingPayments, 60 * 1000);
+setInterval(cleanupOldStartPayloads, 6 * 60 * 60 * 1000);
 
-// ================= SAFETY =================
-process.on('unhandledRejection', (err) => {
-  console.log('UNHANDLED REJECTION:', err);
-});
-
-process.on('uncaughtException', (err) => {
-  console.log('UNCAUGHT EXCEPTION:', err);
-});
-
-// ================= SERVER =================
 app.listen(PORT, async () => {
   console.log(`BOT ONLINE NA PORTA ${PORT}`);
-  await setupTelegramWebhook();
-  await setupCommands();
+  await bot.setWebHook(TELEGRAM_WEBHOOK_URL);
 });
