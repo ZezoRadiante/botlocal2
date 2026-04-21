@@ -1151,10 +1151,13 @@ app.post(PAYMENT_PATH, async (req, res) => {
 
     let paymentResponse;
     try {
-      paymentResponse = await axios.get(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
-        headers: { Authorization: `Bearer ${MERCADOPAGO_ACCESS_TOKEN}` },
-        timeout: 25000
-      });
+      paymentResponse = await axios.get(
+        `https://api.mercadopago.com/v1/payments/${paymentId}`,
+        {
+          headers: { Authorization: `Bearer ${MERCADOPAGO_ACCESS_TOKEN}` },
+          timeout: 25000
+        }
+      );
     } catch (err) {
       if (err.response?.status === 404) {
         console.log('WEBHOOK PAYMENT NOT FOUND (TEST?):', paymentId);
@@ -1205,7 +1208,18 @@ app.post(PAYMENT_PATH, async (req, res) => {
           event_id: uuidv4()
         });
 
-        await bot.sendMessage(tx.chat_id, `✅ PAGAMENTO CONFIRMADO!\n\nSeu acesso está sendo liberado...`);
+        await bot.sendMessage(
+          tx.chat_id,
+          `✅ PAGAMENTO CONFIRMADO!\n\nSeu acesso foi liberado com sucesso 🔥\n\nToque no botão abaixo para entrar agora mesmo:`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '🔒 Acessar conteúdo', url: 'https://t.me/suporterayssabot' }]
+              ]
+            }
+          }
+        );
+
         await sendUpsellMessage(tx.chat_id);
       } else {
         await updateUserByChatId(tx.chat_id, {
@@ -1214,9 +1228,27 @@ app.post(PAYMENT_PATH, async (req, res) => {
         });
 
         await stopAllUserBumps(tx.chat_id);
-        await bot.sendMessage(tx.chat_id, `🚀 ACESSO TOTAL LIBERADO!\n\nAproveite todo o conteúdo 🔥`);
+
+        await bot.sendMessage(
+          tx.chat_id,
+          `🚀 ACESSO TOTAL LIBERADO!\n\nToque no botão abaixo para acessar seu conteúdo agora mesmo.`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '🔒 Acessar conteúdo', url: 'https://t.me/suporterayssabot' }]
+              ]
+            }
+          }
+        );
       }
     }
+
+    return res.sendStatus(200);
+  } catch (err) {
+    console.log('WEBHOOK ERROR:', err.response?.data || err.message || err);
+    return res.sendStatus(200);
+  }
+});
 
     return res.sendStatus(200);
   } catch (err) {
