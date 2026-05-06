@@ -788,6 +788,26 @@ async function goToPayment(chat_id, user, options = {}) {
 
     console.log('MERCADOPAGO TRANSACTION OK:', raw);
 
+    await sendToMeta('InitiateCheckout', {
+      ...user,
+      value: amount,
+      plan: user.plan || '',
+      event_id: `initiatecheckout_${txId}`
+    }, {
+      content_type: 'product',
+      content_name: user.plan || 'Acesso VIP',
+      contents: [
+        {
+          id: user.plan || 'vip',
+          quantity: 1,
+          item_price: amount
+        }
+      ],
+      num_items: 1,
+      payment_method: 'pix',
+      transaction_id: txId
+    });
+
     await sendPixCheckoutMessage(chat_id, txId, amount, pixCode);
   } catch (err) {
     console.log('PAYMENT ERROR FULL:', {
@@ -804,7 +824,6 @@ async function goToPayment(chat_id, user, options = {}) {
     await bot.sendMessage(chat_id, errorMsg, { parse_mode: 'HTML' });
   }
 }
-
 // ================= BUMP WORKER =================
 function getScheduledBumpCopy(index) {
   const copies = [
